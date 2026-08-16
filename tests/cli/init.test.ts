@@ -81,7 +81,7 @@ describe('init TOML templates', () => {
     expect(content).toContain('provider = "openai"');
     expect(content).toContain('[embedding]');
     expect(content).toContain('[rerank]');
-    expect(content).toContain('jina-reranker-v3');
+    expect(content).toContain('jina-reranker-v3.5');
     expect(content).toContain('# api_key = "..."');
     expect(content).toContain('Global config may store local credentials');
   });

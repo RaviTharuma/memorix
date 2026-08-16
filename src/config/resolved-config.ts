@@ -345,7 +345,7 @@ function normalizeExternalContext(value: string | undefined): 'auto' | 'off' | u
 
 function normalizeRerankProvider(value: string | undefined): 'off' | 'http' {
   const normalized = value?.trim().toLowerCase();
-  // `jina` is accepted as an alias for OmniRoute HTTP + jina-reranker-v3.
+  // `jina` is accepted as an alias for OmniRoute HTTP + jina-reranker-v3.5.
   // It never selects a Jina URL.
   if (normalized === 'http' || normalized === 'jina') return 'http';
   return 'off';
