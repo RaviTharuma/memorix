@@ -183,6 +183,11 @@ export default defineCommand({
       envLines.push('');
     }
 
+    envLines.push('# Optional neural rerank via OmniRoute (same bearer as memory LLM)');
+    envLines.push('# MEMORIX_RERANK_PROVIDER=http');
+    envLines.push('# MEMORIX_RERANK_MODEL=jina-reranker-v3');
+    envLines.push('# MEMORIX_RERANK_BASE_URL=https://omniroute.example/v1');
+    envLines.push('');
     envLines.push('# Optional memory LLM simple key (does not apply to embedding or agent lanes)');
     envLines.push('# MEMORIX_API_KEY=sk-your-key-here');
     envLines.push('');
@@ -308,6 +313,14 @@ export function buildInitTomlConfig(options: {
       lines.push('# api_key = "..."');
     }
   }
+  lines.push('');
+
+  lines.push('[rerank]');
+  lines.push('# Remote neural rerank via OmniRoute → Jina. Never a local model or api.jina.ai.');
+  lines.push('# provider = "http"');
+  lines.push('# model = "jina-reranker-v3"');
+  lines.push('# base_url inherits [memory.llm] when unset (OmniRoute /v1).');
+  lines.push('# Bearer inherits the memory LLM OmniRoute key. Do not put a Jina key here.');
   lines.push('');
 
   lines.push('[git]');

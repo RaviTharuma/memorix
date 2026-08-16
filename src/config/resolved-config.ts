@@ -9,9 +9,10 @@ import {
   getProjectYamlPath,
 } from './config-paths.js';
 import { loadFileConfig } from './legacy-loader.js';
-import { loadTomlConfig } from './toml-loader.js';
-import { loadYamlConfig } from './yaml-loader.js';
+import { loadTomlConfig, type MemorixTomlConfig } from './toml-loader.js';
+import { loadYamlConfig, type MemorixYamlConfig } from './yaml-loader.js';
 import { loadDotenv } from './dotenv-loader.js';
+import { JINA_RERANKER_MODEL, isForbiddenRerankHost } from '../rerank/http-provider.js';
 
 export interface ResolvedLaneOptions {
   projectRoot?: string | null;
@@ -43,6 +44,12 @@ export interface ResolvedMemorixConfig {
     baseUrl?: string;
     apiKey?: string;
     dimensions?: number;
+  };
+  rerank: {
+    provider: 'off' | 'http';
+    model: string;
+    baseUrl?: string;
+    apiKey?: string;
   };
   git: {
     autoHook?: boolean;
@@ -109,6 +116,16 @@ export function getResolvedConfig(options: ResolvedLaneOptions = {}): ResolvedMe
   const openRouterMemoryLlmApiKey = isOpenRouterMemoryLane(memoryLlmProvider, memoryLlmBaseUrl)
     ? process.env.OPENROUTER_API_KEY
     : undefined;
+  const memoryLlmApiKey = first(
+    process.env.MEMORIX_LLM_API_KEY,
+    process.env.MEMORIX_API_KEY,
+    toml.memory?.llm?.api_key,
+    yaml.llm?.apiKey,
+    legacy.llm?.apiKey,
+    process.env.OPENAI_API_KEY,
+    process.env.ANTHROPIC_API_KEY,
+    openRouterMemoryLlmApiKey,
+  );
 
   const resolved: ResolvedMemorixConfig = {
     agent: {
@@ -150,16 +167,7 @@ export function getResolvedConfig(options: ResolvedLaneOptions = {}): ResolvedMe
         provider: memoryLlmProvider,
         model: memoryLlmModel,
         baseUrl: memoryLlmBaseUrl,
-        apiKey: first(
-          process.env.MEMORIX_LLM_API_KEY,
-          process.env.MEMORIX_API_KEY,
-          toml.memory?.llm?.api_key,
-          yaml.llm?.apiKey,
-          legacy.llm?.apiKey,
-          process.env.OPENAI_API_KEY,
-          process.env.ANTHROPIC_API_KEY,
-          openRouterMemoryLlmApiKey,
-        ),
+        apiKey: memoryLlmApiKey,
       },
     },
     embedding: {
@@ -169,6 +177,12 @@ export function getResolvedConfig(options: ResolvedLaneOptions = {}): ResolvedMe
       apiKey: first(process.env.MEMORIX_EMBEDDING_API_KEY, toml.embedding?.api_key, yaml.embedding?.apiKey, legacy.embeddingApi?.apiKey, openRouterEmbeddingApiKey),
       dimensions: firstNumber(parseNumber(process.env.MEMORIX_EMBEDDING_DIMENSIONS), toml.embedding?.dimensions, yaml.embedding?.dimensions, legacy.embeddingApi?.dimensions),
     },
+    rerank: resolveRerankLane({
+      toml,
+      yaml,
+      memoryLlmApiKey,
+      memoryLlmBaseUrl,
+    }),
     git: {
       autoHook: firstBool(toml.git?.auto_hook, yaml.git?.autoHook),
       ingestOnCommit: firstBool(toml.git?.ingest_on_commit, yaml.git?.ingestOnCommit),
@@ -244,6 +258,10 @@ export function getResolvedEmbeddingLane(options: ResolvedLaneOptions = {}): Res
   return getResolvedConfig(options).embedding;
 }
 
+export function getResolvedRerankLane(options: ResolvedLaneOptions = {}): ResolvedMemorixConfig['rerank'] {
+  return getResolvedConfig(options).rerank;
+}
+
 export function resetResolvedConfigCache(): void {
   // Kept as a public test helper. File-level caches live in individual loaders.
 }
@@ -294,6 +312,10 @@ function getEnvSourceNames(): string[] {
     'MEMORIX_EMBEDDING_BASE_URL',
     'MEMORIX_EMBEDDING_MODEL',
     'MEMORIX_EMBEDDING_DIMENSIONS',
+    'MEMORIX_RERANK_PROVIDER',
+    'MEMORIX_RERANK_MODEL',
+    'MEMORIX_RERANK_BASE_URL',
+    'MEMORIX_RERANK_API_KEY',
     'MEMORIX_CODEGRAPH_EXTERNAL_CONTEXT',
     'MEMORIX_CODEGRAPH_EXTERNAL_COMMAND',
     'MEMORIX_CODEGRAPH_EXTERNAL_TIMEOUT_MS',
@@ -319,4 +341,52 @@ function normalizeExternalContext(value: string | undefined): 'auto' | 'off' | u
   const normalized = value?.trim().toLowerCase();
   if (normalized === 'auto' || normalized === 'off') return normalized;
   return undefined;
+}
+
+function normalizeRerankProvider(value: string | undefined): 'off' | 'http' {
+  const normalized = value?.trim().toLowerCase();
+  // `jina` is accepted as an alias for OmniRoute HTTP + jina-reranker-v3.
+  // It never selects a Jina URL.
+  if (normalized === 'http' || normalized === 'jina') return 'http';
+  return 'off';
+}
+
+function resolveRerankLane(args: {
+  toml: MemorixTomlConfig;
+  yaml: MemorixYamlConfig;
+  memoryLlmApiKey?: string;
+  memoryLlmBaseUrl?: string;
+}): ResolvedMemorixConfig['rerank'] {
+  const provider = normalizeRerankProvider(first(
+    process.env.MEMORIX_RERANK_PROVIDER,
+    args.toml.rerank?.provider,
+    args.yaml.rerank?.provider,
+    'off',
+  ));
+  const model = first(
+    process.env.MEMORIX_RERANK_MODEL,
+    args.toml.rerank?.model,
+    args.yaml.rerank?.model,
+    JINA_RERANKER_MODEL,
+  ) ?? JINA_RERANKER_MODEL;
+  const explicitBaseUrl = first(
+    process.env.MEMORIX_RERANK_BASE_URL,
+    args.toml.rerank?.base_url,
+    args.yaml.rerank?.baseUrl,
+  );
+  const baseUrl = provider === 'http'
+    ? first(explicitBaseUrl, args.memoryLlmBaseUrl)
+    : explicitBaseUrl;
+  const apiKey = first(
+    process.env.MEMORIX_RERANK_API_KEY,
+    args.toml.rerank?.api_key,
+    args.yaml.rerank?.apiKey,
+    args.memoryLlmApiKey,
+  );
+
+  if (isForbiddenRerankHost(baseUrl)) {
+    return { provider: 'off', model, baseUrl: undefined, apiKey };
+  }
+
+  return { provider, model, baseUrl, apiKey };
 }

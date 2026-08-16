@@ -47,6 +47,12 @@ model = "text-embedding-v4"
 base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 api_key = "..."
 
+[rerank]
+provider = "http"
+model = "jina-reranker-v3"
+# base_url and api_key inherit [memory.llm] when unset.
+# Point base_url at OmniRoute /v1 — never api.jina.ai.
+
 [memory]
 inject = "minimal"
 formation = "active"
@@ -127,7 +133,7 @@ Used by Memorix background memory intelligence:
 - memory formation
 - summarization
 - deduplication
-- optional reranking
+- optional LLM reranking fallback
 - cleanup assistance
 
 Common keys:
@@ -185,6 +191,50 @@ defaults to `qwen/qwen3-embedding-8b` (4096 dimensions) instead of the
 OpenAI-only default. The equivalent env-var form is
 `MEMORIX_EMBEDDING=api`, `MEMORIX_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1`,
 `MEMORIX_EMBEDDING_MODEL=qwen/qwen3-embedding-8b`.
+
+### `[rerank]`
+
+Remote neural rerank. HTTP only — Memorix never loads a local cross-encoder
+and never calls `api.jina.ai`. The client posts the same Cohere-compatible
+body Hindsight uses (`{model, query, documents}`) to OmniRoute
+`POST /v1/rerank`. OmniRoute is the hop that talks to Jina.
+
+Common keys:
+
+- `provider` — `off` (default) or `http` (`jina` is accepted as an alias for `http`)
+- `model` — default `jina-reranker-v3`
+- `base_url` — OmniRoute OpenAI-compatible root, for example
+  `https://omniroute.jaguar-fish.ts.net/v1`. In-cluster:
+  `http://omniroute.omniroute.svc.cluster.local/v1`. When unset and
+  `provider = "http"`, Memorix inherits `[memory.llm].base_url`.
+- `api_key` — OmniRoute bearer. When unset, inherits the memory LLM key
+  (`MEMORIX_LLM_API_KEY`, `MEMORIX_API_KEY`, or `[memory.llm].api_key`).
+  Do not put a Jina key here.
+
+A Jina hostname in `base_url` disables the lane.
+
+Environment overrides (highest priority after CLI flags):
+
+```bash
+MEMORIX_RERANK_PROVIDER=http
+MEMORIX_RERANK_MODEL=jina-reranker-v3
+MEMORIX_RERANK_BASE_URL=https://omniroute.jaguar-fish.ts.net/v1
+# MEMORIX_RERANK_API_KEY=   # optional; inherits the OmniRoute LLM bearer
+```
+
+On a second machine that already talks to OmniRoute for `[memory.llm]`,
+add only:
+
+```toml
+[rerank]
+provider = "http"
+model = "jina-reranker-v3"
+```
+
+or set `MEMORIX_RERANK_PROVIDER=http`. Timeout is still
+`MEMORIX_RERANK_TIMEOUT_MS` (default 5000). Neural rerank runs first on
+the existing thorough/heavy/ambiguous search gate; LLM rerank is the
+fallback.
 
 Image analysis (visual description for ingested images) runs on the LLM lane
 through an OpenAI-compatible vision endpoint, so it can also use OpenRouter

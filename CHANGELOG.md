@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **OmniRoute neural rerank** -- Thorough/heavy/ambiguous search can reorder
+  top hits through `jina-reranker-v3` via OmniRoute `POST /v1/rerank`
+  (Cohere `{model, query, documents}`). Memorix never calls `api.jina.ai`
+  and never loads a local cross-encoder. Configure `[rerank]` or
+  `MEMORIX_RERANK_*`; base URL and bearer inherit the memory LLM OmniRoute
+  lane when unset. LLM rerank remains the fallback.
+
 ## [1.5.1] - 2026-08-16
 
 ### Fixed

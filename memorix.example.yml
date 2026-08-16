@@ -34,6 +34,14 @@ embedding:
   # model: qwen/qwen3-embedding-8b
   # dimensions: 1024        # Override auto-detected dimensions
 
+# ── Neural rerank (OmniRoute → Jina) ─────────────────────────
+# HTTP only. Never a local model. Never api.jina.ai.
+# Bearer inherits MEMORIX_LLM_API_KEY when apiKey is omitted.
+# rerank:
+#   provider: http
+#   model: jina-reranker-v3
+#   baseUrl: https://omniroute.jaguar-fish.ts.net/v1
+
 # ── Git-Memory Pipeline ──────────────────────────────────────
 # Automatically capture engineering knowledge from git commits.
 # Every commit becomes a searchable, immutable memory.
