@@ -7,15 +7,51 @@
  * This directly validates the fix for: "hooks never auto-store during development"
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { execSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { normalizeHookInput } from '../../src/hooks/normalizer.js';
-import { handleHookEvent, resetCooldowns } from '../../src/hooks/handler.js';
+import { formatHookOutput, handleHookEvent, resetCooldowns } from '../../src/hooks/handler.js';
+import { initObservations, storeObservation } from '../../src/memory/observations.js';
+import { endSession, startSession } from '../../src/memory/session.js';
+import { closeAllDatabases } from '../../src/store/sqlite-db.js';
+import { resetObservationStore } from '../../src/store/obs-store.js';
+import { resetDb } from '../../src/store/orama-store.js';
+import { initSessionStore, resetSessionStore } from '../../src/store/session-store.js';
+import { resetTeamStore } from '../../src/team/team-store.js';
+import { MaintenanceJobStore } from '../../src/runtime/maintenance-jobs.js';
 
 describe('Claude Code Hook Handler E2E', () => {
+  const originalCwd = process.cwd();
+  const originalDataDir = process.env.MEMORIX_DATA_DIR;
+  const originalEmbedding = process.env.MEMORIX_EMBEDDING;
+
   // Each `memorix hook` call is a separate process in production,
   // so cooldowns never persist. Reset between tests to simulate this.
   beforeEach(() => {
     resetCooldowns();
+  });
+
+  afterEach(async () => {
+    process.chdir(originalCwd);
+    if (originalDataDir === undefined) {
+      delete process.env.MEMORIX_DATA_DIR;
+    } else {
+      process.env.MEMORIX_DATA_DIR = originalDataDir;
+    }
+    if (originalEmbedding === undefined) {
+      delete process.env.MEMORIX_EMBEDDING;
+    } else {
+      process.env.MEMORIX_EMBEDDING = originalEmbedding;
+    }
+    vi.doUnmock('../../src/config/behavior.js');
+    resetObservationStore();
+    resetSessionStore();
+    resetTeamStore();
+    await resetDb();
+    closeAllDatabases();
   });
   // ─── PostToolUse: Write (most common during development) ───
   it('should auto-store for Write tool (file creation)', async () => {
@@ -47,6 +83,69 @@ export function verifyToken(token: string) {
     expect(observation).not.toBeNull();
     expect(observation!.entityName).toBe('auth');
     expect(observation!.narrative.length).toBeGreaterThan(50);
+    expect(observation!.admissionState).toBe('candidate');
+  });
+
+  it('queues one durable Code Memory refresh after repeated real file mutations', async () => {
+    const sandboxRoot = mkdtempSync(path.join(tmpdir(), 'memorix-hook-refresh-'));
+    const repoDir = path.join(sandboxRoot, 'repo');
+    const dataDir = path.join(sandboxRoot, 'data');
+    try {
+      mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      writeFileSync(path.join(repoDir, 'src', 'auth.ts'), 'export const auth = true;\n', 'utf8');
+      execSync('git init', { cwd: repoDir, stdio: 'ignore' });
+      process.env.MEMORIX_DATA_DIR = dataDir;
+
+      const input = {
+        event: 'post_edit' as const,
+        agent: 'claude' as const,
+        timestamp: '2026-07-17T00:00:00.000Z',
+        sessionId: 'sess-refresh',
+        cwd: repoDir,
+        filePath: 'src/auth.ts',
+        raw: {},
+      };
+      await handleHookEvent(input);
+      await handleHookEvent(input);
+
+      const jobs = new MaintenanceJobStore(dataDir).list({ projectId: 'local/repo' });
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]).toMatchObject({
+        kind: 'codegraph-refresh',
+        dedupeKey: 'codegraph-refresh',
+        payload: { source: 'hook-file-mutation', maxFiles: 5_000 },
+      });
+    } finally {
+      closeAllDatabases();
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('allows the CLI hook path to defer a file-mutation refresh until capture is durable', async () => {
+    const sandboxRoot = mkdtempSync(path.join(tmpdir(), 'memorix-hook-deferred-'));
+    const repoDir = path.join(sandboxRoot, 'repo');
+    const dataDir = path.join(sandboxRoot, 'data');
+    try {
+      mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      writeFileSync(path.join(repoDir, 'src', 'auth.ts'), 'export const auth = true;\n', 'utf8');
+      execSync('git init', { cwd: repoDir, stdio: 'ignore' });
+      process.env.MEMORIX_DATA_DIR = dataDir;
+
+      await handleHookEvent({
+        event: 'post_edit',
+        agent: 'claude',
+        timestamp: new Date().toISOString(),
+        sessionId: 'deferred-hook-session',
+        cwd: repoDir,
+        filePath: 'src/auth.ts',
+        raw: {},
+      }, { deferMaintenance: true });
+
+      expect(new MaintenanceJobStore(dataDir).list({ projectId: 'local/repo' })).toHaveLength(0);
+    } finally {
+      closeAllDatabases();
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
   });
 
   // ─── PostToolUse: Edit (code modifications) ───
@@ -71,6 +170,7 @@ export function verifyToken(token: string) {
     const { observation } = await handleHookEvent(input);
     expect(observation).not.toBeNull();
     expect(observation!.narrative).toContain('PORT');
+    expect(observation!.admissionState).toBe('candidate');
   });
 
   // ─── PostToolUse: Bash (npm install, test, build) ───
@@ -99,6 +199,7 @@ export function verifyToken(token: string) {
     const { observation } = await handleHookEvent(input);
     expect(observation).not.toBeNull();
     expect(observation!.narrative).toContain('npm test');
+    expect(observation!.admissionState).toBe('ephemeral');
   });
 
   // ─── PostToolUse: Bash with SHORT output (edge case) ───
@@ -125,6 +226,7 @@ export function verifyToken(token: string) {
     const { observation } = await handleHookEvent(input);
     // Short output but command is meaningful → should store
     expect(observation).not.toBeNull();
+    expect(observation!.admissionState).toBe('ephemeral');
   });
 
   // ─── UserPromptSubmit ───
@@ -143,6 +245,7 @@ export function verifyToken(token: string) {
     const { observation } = await handleHookEvent(input);
     expect(observation).not.toBeNull();
     expect(observation!.narrative).toContain('JWT');
+    expect(observation!.admissionState).toBe('candidate');
   });
 
   // ─── UserPromptSubmit: SHORT prompt (edge case) ───
@@ -160,6 +263,119 @@ export function verifyToken(token: string) {
     expect(observation).toBeNull();
   });
 
+  it('injects one bounded prior-work brief for an explicit Claude continuation prompt', async () => {
+    const sandboxRoot = mkdtempSync(path.join(tmpdir(), 'memorix-hook-continuation-'));
+    const repoDir = path.join(sandboxRoot, 'repo');
+    const dataDir = path.join(sandboxRoot, 'data');
+    const projectId = 'local/repo';
+    try {
+      mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      writeFileSync(path.join(repoDir, 'src', 'auth.ts'), 'export const authFlag = "AUTH_REFRESH_V2";\n', 'utf8');
+      execSync('git init', { cwd: repoDir, stdio: 'ignore' });
+      process.chdir(repoDir);
+      process.env.MEMORIX_DATA_DIR = dataDir;
+      process.env.MEMORIX_EMBEDDING = 'off';
+      vi.doMock('../../src/config/behavior.js', () => ({
+        getBehaviorConfig: () => ({
+          sessionInject: 'minimal',
+          syncAdvisory: true,
+          autoCleanup: true,
+          formationMode: 'active',
+        }),
+      }));
+      await initObservations(dataDir);
+      await initSessionStore(dataDir);
+      await storeObservation({
+        entityName: 'auth-rollout',
+        type: 'decision',
+        title: 'JWT refresh remains behind AUTH_REFRESH_V2',
+        narrative: 'Keep the flag disabled until the focused migration test is green.',
+        projectId,
+      });
+      await startSession(dataDir, projectId, { sessionId: 'claude-auth', agent: 'claude-code' });
+      await endSession(
+        dataDir,
+        'claude-auth',
+        'The prior agent left AUTH_REFRESH_V2 disabled. Run the focused migration test before enabling it.',
+      );
+
+      const input = normalizeHookInput({
+        hook_event_name: 'UserPromptSubmit',
+        session_id: 'sess-claude-continuation',
+        cwd: repoDir,
+        prompt: 'Please continue the JWT refresh rollout and tell me the next safe step.',
+      });
+      const { output } = await handleHookEvent(input);
+
+      expect(output.systemMessage).toContain('bounded prior-work brief');
+      expect(output.systemMessage).toContain('Resume from prior work');
+      expect(output.systemMessage).toContain('AUTH_REFRESH_V2');
+      const formatted = formatHookOutput('claude', 'UserPromptSubmit', output);
+      expect(formatted).toMatchObject({
+        hookSpecificOutput: {
+          hookEventName: 'UserPromptSubmit',
+          additionalContext: expect.stringContaining('Resume from prior work'),
+        },
+      });
+    } finally {
+      process.chdir(originalCwd);
+      closeAllDatabases();
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps Claude user prompts quiet when they do not ask to continue prior work', async () => {
+    const input = normalizeHookInput({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'sess-claude-new-task',
+      cwd: '/home/user/project',
+      prompt: 'Document the current worker API and explain its public options.',
+    });
+
+    const { output } = await handleHookEvent(input);
+    expect(output.systemMessage).toBeUndefined();
+  });
+
+  it('routes Claude handoff prompts to one Autopilot brief without injecting broad context', async () => {
+    const input = normalizeHookInput({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'sess-claude-handoff',
+      cwd: '/home/user/project',
+      prompt: 'I am taking over this project. Please understand the current state and recommend the next step.',
+    });
+
+    const { output } = await handleHookEvent(input);
+    expect(output.systemMessage).toContain('memorix_project_context');
+    expect(output.systemMessage).toContain('Before broad file or Git exploration');
+    expect(output.systemMessage).not.toContain('Memorix Autopilot Brief');
+    expect(formatHookOutput('claude', 'UserPromptSubmit', output)).toMatchObject({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        additionalContext: expect.stringContaining('memorix_project_context'),
+      },
+    });
+  });
+
+  it('respects silent injection mode for Claude continuation prompts', async () => {
+    vi.doMock('../../src/config/behavior.js', () => ({
+      getBehaviorConfig: () => ({
+        sessionInject: 'silent',
+        syncAdvisory: true,
+        autoCleanup: true,
+        formationMode: 'active',
+      }),
+    }));
+    const input = normalizeHookInput({
+      hook_event_name: 'UserPromptSubmit',
+      session_id: 'sess-claude-silent',
+      cwd: '/home/user/project',
+      prompt: 'Continue the previous authentication rollout with the known context.',
+    });
+
+    const { output } = await handleHookEvent(input);
+    expect(output.systemMessage).toBeUndefined();
+  });
+
   // ─── SessionStart ───
   it('should inject context on SessionStart (no observation stored)', async () => {
     const payload = {
@@ -174,7 +390,58 @@ export function verifyToken(token: string) {
     const { observation, output } = await handleHookEvent(input);
     // SessionStart injects context, doesn't store
     expect(observation).toBeNull();
-    expect(output.systemMessage).toContain('Previous session context available');
+    expect(output.systemMessage).toContain('Previous session context may be available');
+    expect(output.systemMessage).toContain('Use memorix_search when prior project context would materially help');
+  });
+
+  it('should inject auto project context on SessionStart when full injection is enabled', async () => {
+    const sandboxRoot = mkdtempSync(path.join(tmpdir(), 'memorix-hook-auto-context-'));
+    const repoDir = path.join(sandboxRoot, 'repo');
+    const dataDir = path.join(sandboxRoot, 'data');
+    try {
+      mkdirSync(path.join(repoDir, 'src'), { recursive: true });
+      writeFileSync(path.join(repoDir, 'src', 'auth.ts'), 'export function authMiddleware(token: string) { return token.length > 0; }\n', 'utf8');
+      writeFileSync(path.join(repoDir, 'src', 'worker.py'), 'def dispatch_job(name: str):\n    return name.upper()\n', 'utf8');
+      execSync('git init', { cwd: repoDir, stdio: 'ignore' });
+      process.chdir(repoDir);
+      process.env.MEMORIX_DATA_DIR = dataDir;
+      process.env.MEMORIX_EMBEDDING = 'off';
+      vi.doMock('../../src/config/behavior.js', () => ({
+        getBehaviorConfig: () => ({
+          sessionInject: 'full',
+          syncAdvisory: true,
+          autoCleanup: true,
+          formationMode: 'active',
+        }),
+      }));
+      await initObservations(dataDir);
+      await storeObservation({
+        entityName: 'auth',
+        type: 'decision',
+        title: 'authMiddleware owns token verification',
+        narrative: 'When editing login behavior, start with src/auth.ts.',
+        filesModified: ['src/auth.ts'],
+        projectId: 'local/repo',
+      });
+
+      const input = normalizeHookInput({
+        hook_event_name: 'SessionStart',
+        session_id: 'sess-claude-auto-context',
+        cwd: repoDir,
+      });
+      const { observation, output } = await handleHookEvent(input);
+
+      expect(observation).toBeNull();
+      expect(output.systemMessage).toContain('Memorix Autopilot Brief');
+      expect(output.systemMessage).toContain('Start here');
+      expect(output.systemMessage).toContain('src/auth.ts');
+      expect(output.systemMessage).toContain('Code Memory refresh queued');
+      expect(output.systemMessage).not.toContain('SQLite');
+    } finally {
+      process.chdir(originalCwd);
+      closeAllDatabases();
+      rmSync(sandboxRoot, { recursive: true, force: true });
+    }
   });
 
   // ─── Stop (session end) ───

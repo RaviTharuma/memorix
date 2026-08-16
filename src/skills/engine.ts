@@ -45,6 +45,8 @@ interface ObsData {
     concepts?: string[];
     filesModified?: string[];
     createdAt?: string;
+    status?: string;
+    source?: 'agent' | 'git' | 'manual';
 }
 
 /** Entity cluster for skill generation */
@@ -68,7 +70,11 @@ const SKILLS_DIRS: Record<AgentTarget, string[]> = {
     windsurf: ['.windsurf/skills'],
     'claude-code': ['.claude/skills'],
     copilot: ['.github/skills', '.copilot/skills'],
-    antigravity: ['.agent/skills', '.gemini/skills', '.gemini/antigravity/skills'],
+    antigravity: ['.agents/skills', '.agent/skills', '.gemini/antigravity-cli/skills', '.gemini/skills', '.gemini/antigravity/skills'],
+    'gemini-cli': [],
+    openclaw: [],
+    hermes: [],
+    omp: [],
     kiro: ['.kiro/skills'],
     opencode: ['.opencode/skills'],
     trae: ['.trae/skills'],
@@ -84,6 +90,31 @@ const MIN_OBS_FOR_SKILL = 3;
 
 /** Minimum score for skill generation */
 const MIN_SCORE_FOR_SKILL = 5;
+const LOW_SIGNAL_TITLE_PATTERNS = [
+    /^ran:/i,
+    /^command:/i,
+];
+const LOW_SIGNAL_ENTITY_PATTERNS = [
+    /^(?:bash|sh|cmd|powershell|pwsh|node|npm|npx|pnpm|yarn|gh|git)$/i,
+    /^mcp[_-]/i,
+];
+const COMMAND_TRACE_PATTERNS = [
+    /\bcommand:\b/i,
+    /\b2>&1\b/i,
+    /\bselect-string\b/i,
+    /\bget-content\b/i,
+    /\bget-command\b/i,
+    /\bpowershell\b/i,
+    /\bcmd(?:\.exe)?\b/i,
+    /\bnpm\b/i,
+    /\bnpx\b/i,
+    /\bpnpm\b/i,
+    /\byarn\b/i,
+    /\bgit\b/i,
+    /\bgh\b/i,
+    /\|/,
+    /&&/,
+];
 
 export class SkillsEngine {
     private skipGlobal: boolean;
@@ -155,8 +186,10 @@ export class SkillsEngine {
      * rich knowledge accumulation.
      */
     generateFromObservations(observations: ObsData[]): SkillFull[] {
+        const candidates = observations.filter((obs) => !this.isLowSignalObservation(obs));
+
         // 1. Cluster observations by entity
-        const clusters = this.clusterByEntity(observations);
+        const clusters = this.clusterByEntity(candidates);
 
         // 2. Score each cluster for skill-worthiness
         for (const cluster of clusters.values()) {
@@ -215,6 +248,31 @@ export class SkillsEngine {
     private parseDescription(content: string): string {
         const match = content.match(/^---[\s\S]*?description:\s*["']?(.+?)["']?\s*$/m);
         return match ? match[1] : '';
+    }
+
+    private isLowSignalObservation(obs: ObsData): boolean {
+        if (obs.status === 'archived') return true;
+
+        const title = obs.title.trim();
+        const narrative = obs.narrative.trim();
+        const entity = (obs.entityName || '').trim();
+        const haystack = `${title}\n${narrative}`;
+
+        if (LOW_SIGNAL_TITLE_PATTERNS.some((pattern) => pattern.test(title))) {
+            return true;
+        }
+
+        // Generic command/tool entities don't form useful project skills, even if
+        // the observation came from git ingestion rather than an agent trace.
+        if (LOW_SIGNAL_ENTITY_PATTERNS.some((pattern) => pattern.test(entity))) {
+            return true;
+        }
+
+        if (obs.source !== 'git' && COMMAND_TRACE_PATTERNS.filter((pattern) => pattern.test(haystack)).length >= 2) {
+            return true;
+        }
+
+        return false;
     }
 
     private clusterByEntity(observations: ObsData[]): Map<string, EntityCluster> {
@@ -326,7 +384,7 @@ export class SkillsEngine {
 
         // Critical gotchas (most important — put first)
         if (gotchas.length > 0) {
-            lines.push('## ⚠️ Critical Gotchas');
+            lines.push('## [WARN] Critical Gotchas');
             lines.push('');
             for (const g of gotchas) {
                 lines.push(`### ${g.title}`);
@@ -340,7 +398,7 @@ export class SkillsEngine {
 
         // Architecture decisions
         if (decisions.length > 0) {
-            lines.push('## 🏗️ Architecture Decisions');
+            lines.push('## [BUILD] Architecture Decisions');
             lines.push('');
             for (const d of decisions) {
                 lines.push(`### ${d.title}`);
@@ -354,7 +412,7 @@ export class SkillsEngine {
 
         // How it works
         if (howItWorks.length > 0) {
-            lines.push('## 📖 How It Works');
+            lines.push('## [DOCS] How It Works');
             lines.push('');
             for (const h of howItWorks) {
                 lines.push(`### ${h.title}`);
@@ -365,7 +423,7 @@ export class SkillsEngine {
 
         // Common problems & solutions
         if (problems.length > 0) {
-            lines.push('## 🔧 Common Problems & Solutions');
+            lines.push('## [TOOL] Common Problems & Solutions');
             lines.push('');
             for (const p of problems) {
                 lines.push(`### ${p.title}`);
@@ -379,7 +437,7 @@ export class SkillsEngine {
 
         // Trade-offs
         if (tradeoffs.length > 0) {
-            lines.push('## ⚖️ Trade-offs');
+            lines.push('## [TRADEOFF] Trade-offs');
             lines.push('');
             for (const t of tradeoffs) {
                 lines.push(`### ${t.title}`);
@@ -390,7 +448,7 @@ export class SkillsEngine {
 
         // Other notable observations
         if (others.length > 0) {
-            lines.push('## 📝 Notes');
+            lines.push('## [PLAN] Notes');
             lines.push('');
             for (const o of others.slice(0, 5)) {
                 lines.push(`- **${o.title}**: ${o.narrative?.split('\n')[0] || ''}`);
@@ -400,7 +458,7 @@ export class SkillsEngine {
 
         // Key concepts
         if (allConcepts.length > 0) {
-            lines.push('## 🏷️ Related Concepts');
+            lines.push('## [TAG] Related Concepts');
             lines.push('');
             lines.push(allConcepts.map(c => `\`${c}\``).join(', '));
             lines.push('');
@@ -408,7 +466,7 @@ export class SkillsEngine {
 
         // Quick facts summary
         if (allFacts.length > 0) {
-            lines.push('## 📌 Quick Facts');
+            lines.push('## [PIN] Quick Facts');
             lines.push('');
             for (const f of allFacts.slice(0, 15)) {
                 lines.push(`- ${f}`);

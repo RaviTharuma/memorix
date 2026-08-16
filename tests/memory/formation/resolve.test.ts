@@ -171,6 +171,36 @@ describe('Formation Stage 2: Resolve', () => {
     expect(result.action).toBe('new');
   });
 
+  it('should not treat raw ranking scores above 1 as duplicate similarity', async () => {
+    const result = await runResolve(
+      makeExtract({
+        title: 'NAS RAID-Z2 storage decision',
+        entityName: 'home-network',
+        narrative: 'Use a NAS with RAID-Z2 for home media backups and snapshot retention. Keep router DNS separate from storage services.',
+        facts: ['NAS uses RAID-Z2', 'Router DNS stays separate'],
+      }),
+      'test-project',
+      async () => [makeHit({
+        observationId: 17,
+        title: 'Debug log dump',
+        entityName: 'kilo-conversation',
+        narrative: 'Long trace with generic technical terms: error plugin session memorix config store file trace command output.',
+        facts: 'Debug trace captured from plugin runtime',
+        score: 272.71,
+      })],
+      () => makeRef({
+        id: 17,
+        title: 'Debug log dump',
+        entityName: 'kilo-conversation',
+        narrative: 'Long trace with generic technical terms: error plugin session memorix config store file trace command output.',
+        facts: ['Debug trace captured from plugin runtime'],
+      }),
+    );
+
+    expect(result.action).toBe('new');
+    expect(result.reason).toContain('Different from existing memories');
+  });
+
   it('should merge facts without duplicates', async () => {
     const result = await runResolve(
       makeExtract({

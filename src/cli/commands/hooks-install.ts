@@ -16,7 +16,7 @@ export default defineCommand({
   args: {
     agent: {
       type: 'string',
-      description: 'Target agent (skip TUI selection)',
+      description: 'Target agent (skip TUI selection; package-owned targets point to setup)',
       required: false,
     },
     global: {
@@ -57,19 +57,20 @@ export default defineCommand({
     const availableAgents = detectedAgents.filter((agent) => !installedAgents.has(agent));
 
     if (availableAgents.length === 0) {
-      console.log('✅ All detected agents already have hooks installed.');
+      console.log('[OK] All detected agents already have hooks installed.');
       return;
     }
 
     // TUI interactive selection
     p.intro('Memorix Hooks Installation');
 
+    const { AGENT_SUPPORT_TIER } = await import('../../hooks/types.js');
     const selected = await p.multiselect({
       message: 'Select IDEs to install Memorix hooks:',
       options: availableAgents.map((agent) => ({
         value: agent,
         label: getAgentLabel(agent),
-        hint: getAgentHint(agent),
+        hint: getAgentHint(agent) + ` [${AGENT_SUPPORT_TIER[agent as import('../../hooks/types.js').AgentName] ?? 'community'}]`,
       })),
       required: false,
     });
@@ -102,7 +103,7 @@ export default defineCommand({
       await installSingleAgent(agent, cwd, args.global ?? false);
     }
 
-    p.outro('✅ Hooks installed! Restart your IDE to apply.');
+    p.outro('[OK] Hooks installed! Restart your IDE to apply.');
   },
 });
 
@@ -114,23 +115,51 @@ async function installSingleAgent(agent: string, cwd: string, global: boolean): 
       cwd,
       global,
     );
-    console.log(`✅ ${agent}: hooks installed -> ${config.configPath}`);
+    console.log(`[OK] ${agent}: hooks installed -> ${config.configPath}`);
     console.log(`   Events: ${config.events.join(', ')}`);
+
+    // Copilot on Windows without pwsh: warn about runtime compatibility
+    if (agent === 'copilot' && process.platform === 'win32') {
+      try {
+        const { execSync } = await import('node:child_process');
+        execSync('pwsh --version', {
+          encoding: 'utf-8',
+          timeout: 3000,
+          stdio: ['pipe', 'pipe', 'ignore'],
+          windowsHide: true,
+        });
+      } catch {
+        console.warn(`[WARN]  ${agent}: pwsh (PowerShell v7+) not found. Copilot hooks will use the bash field via Git Bash.`);
+        console.warn(`   For best Windows support, install PowerShell v7+: winget install Microsoft.PowerShell`);
+      }
+    }
+
+    // Copilot global not supported
+    if (agent === 'copilot' && global) {
+      const note = (config.generated as Record<string, unknown>)?.note;
+      if (note) console.warn(`[WARN]  ${note}`);
+    }
   } catch (err) {
-    console.error(`❌ ${agent}: failed - ${err}`);
+    console.error(`[ERROR] ${agent}: failed - ${err}`);
   }
 }
 
 function getAgentLabel(agent: string): string {
   const labels: Record<string, string> = {
     claude: 'Claude Code',
+    codex: 'Codex',
     windsurf: 'Windsurf',
     cursor: 'Cursor',
     copilot: 'VS Code Copilot',
     opencode: 'OpenCode',
     kiro: 'Kiro',
     antigravity: 'Antigravity',
+    'gemini-cli': 'Gemini CLI',
+    openclaw: 'OpenClaw',
+    hermes: 'Hermes Agent',
+    omp: 'Oh-my-Pi',
     trae: 'Trae',
+    dsh: 'DeepSeek Harness',
   };
   return labels[agent] || agent;
 }
@@ -139,12 +168,18 @@ function getAgentHint(agent: string): string {
   const hints: Record<string, string> = {
     claude: '.claude/settings.json',
     windsurf: '.windsurf/hooks.json',
-    cursor: '.cursor/rules/memorix.mdc',
-    copilot: '.github/hooks/memorix.json',
-    opencode: '.opencode/hooks.json',
-    kiro: '.kiro/hooks.json',
-    antigravity: '.gemini/settings.json',
-    trae: '.trae/hooks.json',
+    cursor: '.cursor/hooks.json',
+    copilot: '.github/hooks/memorix.json (project-only, no global)',
+    opencode: '.opencode/plugins/memorix.js',
+    kiro: '.kiro/hooks/memorix-agent-stop.kiro.hook',
+    antigravity: '.agents/hooks.json or ~/.gemini/config/hooks.json',
+    'gemini-cli': '.gemini/settings.json',
+    openclaw: 'OpenClaw bundle hooks; use `memorix setup --agent openclaw`',
+    hermes: 'Hermes plugin hooks; use `memorix setup --agent hermes`',
+    omp: 'Oh-my-Pi package hooks; use `memorix setup --agent omp`',
+    trae: '.trae/rules/project_rules.md (rules only, no hooks system)',
+    dsh: '~/.dsh/cordis.patch.yml MCP row via `memorix setup --agent dsh` (no hooks system)',
+    codex: 'Codex plugin hooks; use `memorix setup --agent codex`',
   };
   return hints[agent] || '';
 }

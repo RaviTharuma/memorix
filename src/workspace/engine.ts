@@ -17,6 +17,10 @@ import { CodexMCPAdapter } from './mcp-adapters/codex.js';
 import { ClaudeCodeMCPAdapter } from './mcp-adapters/claude-code.js';
 import { CopilotMCPAdapter } from './mcp-adapters/copilot.js';
 import { AntigravityMCPAdapter } from './mcp-adapters/antigravity.js';
+import { GeminiCLIMCPAdapter } from './mcp-adapters/gemini-cli.js';
+import { OpenClawMCPAdapter } from './mcp-adapters/openclaw.js';
+import { HermesMCPAdapter } from './mcp-adapters/hermes.js';
+import { OmpMCPAdapter } from './mcp-adapters/omp.js';
 import { KiroMCPAdapter } from './mcp-adapters/kiro.js';
 import { OpenCodeMCPAdapter } from './mcp-adapters/opencode.js';
 import { TraeMCPAdapter } from './mcp-adapters/trae.js';
@@ -55,6 +59,10 @@ export class WorkspaceSyncEngine {
       ['claude-code', new ClaudeCodeMCPAdapter()],
       ['copilot', new CopilotMCPAdapter()],
       ['antigravity', new AntigravityMCPAdapter()],
+      ['gemini-cli', new GeminiCLIMCPAdapter()],
+      ['openclaw', new OpenClawMCPAdapter()],
+      ['hermes', new HermesMCPAdapter()],
+      ['omp', new OmpMCPAdapter()],
       ['kiro', new KiroMCPAdapter()],
       ['opencode', new OpenCodeMCPAdapter()],
       ['trae', new TraeMCPAdapter()],
@@ -74,6 +82,10 @@ export class WorkspaceSyncEngine {
       'claude-code': [],
       copilot: [],
       antigravity: [],
+      'gemini-cli': [],
+      openclaw: [],
+      hermes: [],
+      omp: [],
       kiro: [],
       opencode: [],
       trae: [],
@@ -86,8 +98,11 @@ export class WorkspaceSyncEngine {
 
       const pathsToCheck = [configPath, globalPath];
 
-      // Antigravity has an additional config at ~/.gemini/antigravity/mcp_config.json
+      // Antigravity 2.0 writes dedicated profiles; keep old Gemini paths readable
+      // so existing users do not disappear from scans after upgrading.
       if (target === 'antigravity') {
+        pathsToCheck.push(join(this.projectRoot, '.gemini', 'settings.json'));
+        pathsToCheck.push(join(homedir(), '.gemini', 'settings.json'));
         pathsToCheck.push(join(homedir(), '.gemini', 'antigravity', 'mcp_config.json'));
       }
 
@@ -226,7 +241,11 @@ export class WorkspaceSyncEngine {
     windsurf: ['.windsurf/skills'],
     'claude-code': ['.claude/skills'],
     copilot: ['.github/skills', '.copilot/skills'],
-    antigravity: ['.agent/skills', '.gemini/skills', '.gemini/antigravity/skills'],
+    antigravity: ['.agents/skills', '.agent/skills', '.gemini/antigravity-cli/skills', '.gemini/skills', '.gemini/antigravity/skills'],
+    'gemini-cli': [],
+    openclaw: [],
+    hermes: [],
+    omp: [],
     kiro: ['.kiro/skills'],
     opencode: ['.opencode/skills'],
     trae: ['.trae/skills'],
@@ -393,30 +412,30 @@ export class WorkspaceSyncEngine {
     // Build summary
     const lines: string[] = [];
     if (applyResult.success) {
-      lines.push(`✅ Applied ${applyResult.filesWritten.length} file(s) for ${target}`);
+      lines.push(`[OK] Applied ${applyResult.filesWritten.length} file(s) for ${target}`);
       for (const f of applyResult.filesWritten) {
         lines.push(`  → ${f}`);
       }
       if (skillResult.copied.length > 0) {
-        lines.push(`\n🧩 Copied ${skillResult.copied.length} skill(s):`);
+        lines.push(`\n[SKILL] Copied ${skillResult.copied.length} skill(s):`);
         for (const sk of skillResult.copied) {
           lines.push(`  → ${sk}`);
         }
       }
       if (skillResult.skipped.length > 0) {
-        lines.push(`\n⏭️ Skipped ${skillResult.skipped.length} skill(s):`);
+        lines.push(`\n[SKIP] Skipped ${skillResult.skipped.length} skill(s):`);
         for (const sk of skillResult.skipped) {
           lines.push(`  → ${sk}`);
         }
       }
       if (syncResult.skills.conflicts.length > 0) {
-        lines.push(`\n⚠️ Name conflicts (${syncResult.skills.conflicts.length}):`);
+        lines.push(`\n[WARN] Name conflicts (${syncResult.skills.conflicts.length}):`);
         for (const c of syncResult.skills.conflicts) {
           lines.push(`  → "${c.name}": kept ${c.kept.sourceAgent}, skipped ${c.skipped.sourceAgent}`);
         }
       }
       if (applyResult.backups.length > 0) {
-        lines.push(`\n📦 Backups created (${applyResult.backups.length}):`);
+        lines.push(`\n[PACKAGE] Backups created (${applyResult.backups.length}):`);
         for (const b of applyResult.backups) {
           lines.push(`  ${b.originalPath} → ${b.backupPath}`);
         }
@@ -424,12 +443,12 @@ export class WorkspaceSyncEngine {
       // Clean up backups after successful apply
       applier.cleanBackups(applyResult.backups);
     } else {
-      lines.push(`❌ Apply failed for ${target}`);
+      lines.push(`[ERROR] Apply failed for ${target}`);
       for (const e of applyResult.errors) {
         lines.push(`  Error: ${e}`);
       }
       if (applyResult.backups.length > 0) {
-        lines.push(`\n🔄 Rolled back ${applyResult.backups.length} file(s)`);
+        lines.push(`\n[UPDATED] Rolled back ${applyResult.backups.length} file(s)`);
       }
     }
 
@@ -442,13 +461,14 @@ export class WorkspaceSyncEngine {
   // ---- Private helpers ----
 
   private agentToRuleSource(target: AgentTarget): RuleSource | null {
-    const map: Record<AgentTarget, RuleSource> = {
+    const map: Partial<Record<AgentTarget, RuleSource>> = {
       cursor: 'cursor',
       'claude-code': 'claude-code',
       codex: 'codex',
       windsurf: 'windsurf',
       copilot: 'copilot',
       antigravity: 'antigravity',
+      'gemini-cli': 'gemini-cli',
       kiro: 'kiro',
       opencode: 'codex',
       trae: 'trae',

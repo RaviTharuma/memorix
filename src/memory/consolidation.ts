@@ -16,11 +16,18 @@
  */
 
 import type { Observation } from '../types.js';
-import { loadObservationsJson, saveObservationsJson } from '../store/persistence.js';
-import { withFileLock } from '../store/file-lock.js';
+import { getObservationStore } from '../store/obs-store.js';
+import { isEligibleForAutomaticDelivery } from './admission.js';
+import { resolveObservationVisibility } from './visibility.js';
 
 /** Default similarity threshold for merging (0.0-1.0) */
 const DEFAULT_SIMILARITY_THRESHOLD = 0.45;
+
+/** Higher threshold for high-value types — only near-duplicates should merge */
+const HIGH_VALUE_SIMILARITY_THRESHOLD = 0.85;
+
+/** Types that require much higher similarity to merge (carry unique implementation detail) */
+const HIGH_VALUE_TYPES = new Set(['gotcha', 'decision', 'trade-off', 'reasoning', 'problem-solution']);
 
 /** Minimum cluster size to trigger consolidation */
 const MIN_CLUSTER_SIZE = 2;
@@ -83,6 +90,10 @@ export interface ConsolidationResult {
   observationsMerged: number;
   /** Number of observations after consolidation */
   observationsAfter: number;
+  /** Number of active project observations inspected in this bounded pass. */
+  scanned: number;
+  /** Present when another bounded pass is needed to cover this project. */
+  nextCursor?: number;
   /** Details of each merge */
   merges: Array<{
     clusterId: number;
@@ -92,60 +103,79 @@ export interface ConsolidationResult {
   }>;
 }
 
-/**
- * Find clusters of similar observations that could be consolidated.
- * Does NOT modify data — use this for preview / dry run.
- */
-export async function findConsolidationCandidates(
-  projectDir: string,
+interface ConsolidationPage {
+  observations: Observation[];
+  nextCursor?: number;
+}
+
+function clampBatchSize(limit: number | undefined): number {
+  if (!Number.isFinite(limit)) return MAX_BATCH_SIZE;
+  return Math.min(MAX_BATCH_SIZE, Math.max(1, Math.floor(limit!)));
+}
+
+function clampCursor(afterId: number | undefined): number {
+  if (!Number.isFinite(afterId)) return 0;
+  return Math.max(0, Math.floor(afterId!));
+}
+
+async function loadConsolidationPage(
   projectId: string,
-  opts?: { threshold?: number; limit?: number },
-): Promise<ConsolidationCluster[]> {
-  const threshold = opts?.threshold ?? DEFAULT_SIMILARITY_THRESHOLD;
-  const limit = opts?.limit ?? MAX_BATCH_SIZE;
+  options: { limit?: number; afterId?: number },
+): Promise<ConsolidationPage> {
+  const limit = clampBatchSize(options.limit);
+  const page = await getObservationStore().loadByProject(projectId, {
+    status: 'active',
+    afterId: clampCursor(options.afterId),
+    limit: limit + 1,
+  });
+  const hasMore = page.length > limit;
+  const observations = hasMore ? page.slice(0, limit) : page;
+  return hasMore && observations.length > 0
+    ? { observations, nextCursor: observations[observations.length - 1].id }
+    : { observations };
+}
 
-  const allObs = (await loadObservationsJson(projectDir)) as Observation[];
-  const projectObs = allObs
-    .filter(o => o.projectId === projectId)
-    .slice(0, limit);
+function findClusters(observations: Observation[], threshold: number): ConsolidationCluster[] {
+  // Pending automatic evidence must stay individually inspectable until its
+  // source-backed qualification step completes. Consolidating it first would
+  // erase the evidence grain the control plane still needs to audit.
+  // Consolidation is a project-level maintenance action. Personal notes and
+  // targeted handoffs must remain individually inspectable and are never
+  // merged by a background job or another agent's manual cleanup.
+  const eligible = observations
+    .filter(isEligibleForAutomaticDelivery)
+    .filter((observation) => resolveObservationVisibility(observation) === 'project');
+  if (eligible.length < MIN_CLUSTER_SIZE) return [];
 
-  if (projectObs.length < MIN_CLUSTER_SIZE) return [];
-
-  // Group by entity + type
   const groups = new Map<string, Observation[]>();
-  for (const obs of projectObs) {
+  for (const obs of eligible) {
     const key = `${obs.entityName}::${obs.type}`;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(obs);
+    const group = groups.get(key) ?? [];
+    group.push(obs);
+    groups.set(key, group);
   }
 
   const clusters: ConsolidationCluster[] = [];
-
-  for (const [, group] of groups) {
+  for (const group of groups.values()) {
     if (group.length < MIN_CLUSTER_SIZE) continue;
 
-    // Pre-compute fingerprints
-    const fingerprints = group.map(obs => ({
-      obs,
-      tokens: tokenize(observationFingerprint(obs)),
-    }));
-
-    // Track which observations are already clustered
+    const groupType = group[0].type;
+    const effectiveThreshold = HIGH_VALUE_TYPES.has(groupType)
+      ? Math.max(threshold, HIGH_VALUE_SIMILARITY_THRESHOLD)
+      : threshold;
+    const fingerprints = group.map(obs => ({ obs, tokens: tokenize(observationFingerprint(obs)) }));
     const clustered = new Set<number>();
 
-    // Greedy clustering: for each unclustered obs, find similar ones
     for (let i = 0; i < fingerprints.length; i++) {
       if (clustered.has(fingerprints[i].obs.id)) continue;
 
       const cluster: Observation[] = [fingerprints[i].obs];
       let totalSim = 0;
       let simCount = 0;
-
       for (let j = i + 1; j < fingerprints.length; j++) {
         if (clustered.has(fingerprints[j].obs.id)) continue;
-
         const sim = jaccardSimilarity(fingerprints[i].tokens, fingerprints[j].tokens);
-        if (sim >= threshold) {
+        if (sim >= effectiveThreshold) {
           cluster.push(fingerprints[j].obs);
           totalSim += sim;
           simCount++;
@@ -169,6 +199,20 @@ export async function findConsolidationCandidates(
 }
 
 /**
+ * Find clusters of similar observations that could be consolidated.
+ * Does NOT modify data — use this for preview / dry run.
+ */
+export async function findConsolidationCandidates(
+  _projectDir: string,
+  projectId: string,
+  opts?: { threshold?: number; limit?: number; afterId?: number },
+): Promise<ConsolidationCluster[]> {
+  const threshold = opts?.threshold ?? DEFAULT_SIMILARITY_THRESHOLD;
+  const page = await loadConsolidationPage(projectId, opts ?? {});
+  return findClusters(page.observations, threshold);
+}
+
+/**
  * Execute consolidation — merge clusters into single observations.
  *
  * For each cluster:
@@ -178,18 +222,21 @@ export async function findConsolidationCandidates(
  * 4. Remove the other members
  */
 export async function executeConsolidation(
-  projectDir: string,
+  _projectDir: string,
   projectId: string,
-  opts?: { threshold?: number; limit?: number },
+  opts?: { threshold?: number; limit?: number; afterId?: number },
 ): Promise<ConsolidationResult> {
-  const clusters = await findConsolidationCandidates(projectDir, projectId, opts);
+  const store = getObservationStore();
+  const page = await loadConsolidationPage(projectId, opts ?? {});
+  const clusters = findClusters(page.observations, opts?.threshold ?? DEFAULT_SIMILARITY_THRESHOLD);
 
   if (clusters.length === 0) {
-    const allObs = (await loadObservationsJson(projectDir)) as Observation[];
     return {
       clustersFound: 0,
       observationsMerged: 0,
-      observationsAfter: allObs.filter(o => o.projectId === projectId).length,
+      observationsAfter: await store.countByProject(projectId),
+      scanned: page.observations.length,
+      ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
       merges: [],
     };
   }
@@ -198,19 +245,23 @@ export async function executeConsolidation(
     clustersFound: clusters.length,
     observationsMerged: 0,
     observationsAfter: 0,
+    scanned: page.observations.length,
+    ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
     merges: [],
   };
 
-  await withFileLock(projectDir, async () => {
-    const allObs = (await loadObservationsJson(projectDir)) as Observation[];
-    const obsMap = new Map(allObs.map(o => [o.id, o]));
+  await store.atomic(async (tx) => {
     const idsToRemove = new Set<number>();
+    const updated = new Map<number, Observation>();
 
     for (let ci = 0; ci < clusters.length; ci++) {
       const cluster = clusters[ci];
-      const members = cluster.ids
-        .map(id => obsMap.get(id))
-        .filter((o): o is Observation => o !== undefined);
+      const members = (await Promise.all(cluster.ids.map((id) => tx.getById(id))))
+        .filter((observation): observation is Observation => {
+          if (!observation) return false;
+          return observation.projectId === projectId
+            && (observation.status ?? 'active') === 'active';
+        });
 
       if (members.length < MIN_CLUSTER_SIZE) continue;
 
@@ -262,6 +313,7 @@ export async function executeConsolidation(
       primary.narrative = narrativeParts.join('\n\n');
       primary.updatedAt = new Date().toISOString();
       primary.revisionCount = (primary.revisionCount ?? 1) + others.length;
+      updated.set(primary.id, primary);
 
       // Mark others for removal
       for (const other of others) {
@@ -277,12 +329,11 @@ export async function executeConsolidation(
       });
     }
 
-    // Remove merged observations
-    const remaining = allObs.filter(o => !idsToRemove.has(o.id));
-    await saveObservationsJson(projectDir, remaining);
-
-    result.observationsAfter = remaining.filter(o => o.projectId === projectId).length;
+    await Promise.all([...updated.values()].map((observation) => tx.update(observation)));
+    await Promise.all([...idsToRemove].map((id) => tx.remove(id)));
   });
+
+  result.observationsAfter = await store.countByProject(projectId);
 
   return result;
 }

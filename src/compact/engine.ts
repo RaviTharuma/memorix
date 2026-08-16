@@ -9,23 +9,93 @@
  * Layer 3 (detail)   → Full observation content (~500-1000 tokens/result)
  */
 
-import type { SearchOptions, IndexEntry, TimelineContext, MemorixDocument } from '../types.js';
-import { searchObservations, getTimeline } from '../store/orama-store.js';
+import type { SearchOptions, IndexEntry, TimelineContext, MemorixDocument, ObservationRef, MemoryRef, MiniSkill, SourceSnapshot, ObservationReader } from '../types.js';
+import { searchObservations, getTimeline, getObservationsByIds, makeOramaObservationId } from '../store/orama-store.js';
 import { getObservation, getAllObservations } from '../memory/observations.js';
-import { formatIndexTable, formatTimeline, formatObservationDetail } from './index-format.js';
+import { ensureFreshIndex } from '../memory/freshness.js';
+import { formatIndexTable, formatTimeline, formatObservationDetail, type RetrievalSurface } from './index-format.js';
 import { countTextTokens } from './token-budget.js';
+import { resolveAliases } from '../project/aliases.js';
+import { parseMemoryRef } from '../memory/refs.js';
+import { getObservationStore } from '../store/obs-store.js';
+import { getMiniSkillStore } from '../store/mini-skill-store.js';
+import { miniSkillToDocument, resolveProvenanceStatus, type ProvenanceStatus } from '../skills/mini-skills.js';
+import { redactCredentials } from '../memory/secret-filter.js';
+import { canReadObservation, filterReadableObservations } from '../memory/visibility.js';
+
+export function normalizeMemoryBrowseQuery(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) return '';
+
+  const compact = trimmed.toLowerCase().replace(/\s+/g, '');
+  const broadMemoryRequests = new Set([
+    '检索记忆',
+    '搜索记忆',
+    '查看记忆',
+    '看看记忆',
+    '列出记忆',
+    '有哪些记忆',
+    '有那些记忆',
+    '我们有哪些记忆',
+    '我们有那些记忆',
+    '我们有什么记忆',
+    '有什么记忆',
+    '所有记忆',
+    '全部记忆',
+    '记忆概览',
+    '记忆总览',
+    '记忆列表',
+    '记忆',
+    '项目记忆',
+    'memory',
+    'memories',
+    'showmemory',
+    'showmemories',
+    'listmemory',
+    'listmemories',
+    'recentmemory',
+    'recentmemories',
+  ]);
+
+  return broadMemoryRequests.has(compact) ? '' : query;
+}
 
 /**
  * Layer 1: Search and return a compact index.
  * Agent scans this to decide which observations to fetch in detail.
  */
-export async function compactSearch(options: SearchOptions): Promise<{
+export async function compactSearch(options: SearchOptions, surface: RetrievalSurface = 'mcp'): Promise<{
   entries: IndexEntry[];
   formatted: string;
   totalTokens: number;
 }> {
-  const entries = await searchObservations(options);
-  const formatted = formatIndexTable(entries, options.query);
+  await ensureFreshIndex();
+  const searchOptions = { ...options, query: normalizeMemoryBrowseQuery(options.query) };
+  const entries = (await searchObservations(searchOptions)).map((entry) =>
+    entry.projectId || !options.projectId ? entry : { ...entry, projectId: options.projectId },
+  );
+  let formatted = formatIndexTable(entries, searchOptions.query, !options.projectId, surface);
+
+  if (entries.length === 0 && options.projectId) {
+    const allObservations = filterReadableObservations(getAllObservations(), options.reader);
+    const projectAliases = new Set(await resolveAliases(options.projectId).catch(() => [options.projectId]));
+    const projectHasStoredMemory = allObservations.some((obs) => obs.projectId && projectAliases.has(obs.projectId));
+    if (!projectHasStoredMemory) {
+      formatted =
+        options.reader
+          ? `No Memorix memories are available to this session yet.\n\n` +
+            `The tool call worked, but this session has no project-visible memory to retrieve.`
+          : `This project does not have any Memorix memories yet.\n\n` +
+            `It looks like a fresh project: the tool call worked, but there is nothing stored to retrieve yet.\n\n` +
+            `Memories will start appearing after observations, session summaries, hook captures, or git-memory are written.`;
+    } else {
+      formatted =
+        `No memories found matching "${options.query}".\n\n` +
+        `This project does have stored Memorix memories, but none matched the current query/filter. ` +
+        `Try a more specific topic, use /memory status for runtime diagnostics, or ask for recent memory if you want a broad overview.`;
+    }
+  }
+
   const totalTokens = countTextTokens(formatted);
 
   return { entries, formatted, totalTokens };
@@ -40,12 +110,14 @@ export async function compactTimeline(
   projectId?: string,
   depthBefore = 3,
   depthAfter = 3,
+  reader?: ObservationReader,
+  surface: RetrievalSurface = 'mcp',
 ): Promise<{
   timeline: TimelineContext;
   formatted: string;
   totalTokens: number;
 }> {
-  const result = await getTimeline(anchorId, projectId, depthBefore, depthAfter);
+  const result = await getTimeline(anchorId, projectId, depthBefore, depthAfter, reader);
 
   const timeline: TimelineContext = {
     anchorId,
@@ -54,31 +126,102 @@ export async function compactTimeline(
     after: result.after,
   };
 
-  const formatted = formatTimeline(timeline);
+  const formatted = formatTimeline(timeline, surface);
   const totalTokens = countTextTokens(formatted);
 
   return { timeline, formatted, totalTokens };
 }
 
 /**
- * Layer 3: Get full observation details by IDs.
+ * Layer 3: Get full observation or mini-skill details by IDs or typed refs.
  * Only called after the agent has filtered via L1/L2.
+ *
+ * Phase 3a: Accepts typed MemoryRef inputs (obs:42, skill:3) alongside
+ * legacy bare numbers and ObservationRef objects.
  */
 export async function compactDetail(
-  ids: number[],
+  idsOrRefs: number[] | ObservationRef[] | string[],
+  options: { reader?: ObservationReader } = {},
 ): Promise<{
   documents: MemorixDocument[];
   formatted: string;
   totalTokens: number;
 }> {
-  // Use in-memory observations for reliable ID lookup (Orama where-clause
-  // can be unreliable with empty term + number filter)
-  const documents: MemorixDocument[] = [];
-  for (const id of ids) {
-    const obs = getObservation(id);
-    if (obs) {
-      documents.push({
-        id: `obs-${obs.id}`,
+  // Parse all inputs into typed MemoryRefs — fail-fast on invalid refs
+  const invalidRefs: string[] = [];
+  const parsedRefs: MemoryRef[] = [];
+  for (let i = 0; i < (idsOrRefs as any[]).length; i++) {
+    const item = (idsOrRefs as any[])[i];
+    if (typeof item === 'number') {
+      parsedRefs.push({ kind: 'obs' as const, id: item });
+    } else if (typeof item === 'string') {
+      try { parsedRefs.push(parseMemoryRef(item)); } catch { invalidRefs.push(item); }
+    } else if (item && typeof item === 'object' && 'id' in item && typeof item.id === 'number') {
+      parsedRefs.push({ kind: 'obs' as const, id: item.id, projectId: item.projectId });
+    } else {
+      invalidRefs.push(String(item));
+    }
+  }
+  if (invalidRefs.length > 0) {
+    throw new Error(
+      `Invalid memory ref(s): ${invalidRefs.map(r => `"${r}"`).join(', ')}. ` +
+      `Expected: obs:<id>, skill:<id>, obs:<id>@<projectId>, or a bare number.`,
+    );
+  }
+
+  // Tag each ref with its original position so we can reassemble in order
+  const obsRefsIndexed = parsedRefs
+    .map((r, i) => ({ ref: r, idx: i }))
+    .filter((x) => x.ref.kind === 'obs');
+  const skillRefsIndexed = parsedRefs
+    .map((r, i) => ({ ref: r, idx: i }))
+    .filter((x) => x.ref.kind === 'skill');
+
+  // Per-slot results — keyed by original parsedRefs index
+  const slotDoc = new Map<number, MemorixDocument>();
+  const slotFormatted = new Map<number, string>();
+
+  // --- Resolve mini-skill refs ---
+  if (skillRefsIndexed.length > 0) {
+    try {
+      const store = getMiniSkillStore();
+      const allSkills = await store.loadAll();
+      const skillMap = new Map(allSkills.map((s) => [s.id, s]));
+      for (const { ref, idx } of skillRefsIndexed) {
+        const skill = skillMap.get(ref.id);
+        if (skill) {
+          slotDoc.set(idx, miniSkillToDocument(skill));
+          const obsLookup = (id: number) => getObservation(id);
+          const status = resolveProvenanceStatus(skill, obsLookup);
+          slotFormatted.set(idx, formatMiniSkillDetail(skill, status));
+        } else {
+          slotFormatted.set(idx, `Mini-skill S${ref.id} not found.`);
+        }
+      }
+    } catch {
+      for (const { ref, idx } of skillRefsIndexed) {
+        slotFormatted.set(idx, `Mini-skill S${ref.id}: store unavailable.`);
+      }
+    }
+  }
+
+  // --- Resolve observation refs (existing path) ---
+  const refs: ObservationRef[] = obsRefsIndexed.map((x) => ({ id: x.ref.id, projectId: x.ref.projectId }));
+
+  // Prefer in-memory observations for current-project reliability, but fall back
+  // to the global Orama index so cross-project search results can still open.
+  // Security: refs WITHOUT projectId are treated as ambiguous — the in-memory
+  // lookup may return a wrong-project observation. Callers (memorix_detail tool)
+  // should always inject projectId for bare numeric IDs.
+  await ensureFreshIndex(); // unified freshness gate: observations + mini-skills
+  const toRefKey = (ref: ObservationRef) => `${ref.projectId ?? ''}::${ref.id}`;
+  const documentMap = new Map<string, MemorixDocument>();
+  const missingRefs: ObservationRef[] = [];
+  for (const ref of refs) {
+    const obs = getObservation(ref.id, ref.projectId);
+    if (obs && (ref.projectId ? obs.projectId === ref.projectId : true) && canReadObservation(obs, options.reader)) {
+      documentMap.set(toRefKey(ref), {
+        id: makeOramaObservationId(obs.projectId, obs.id),
         observationId: obs.id,
         entityName: obs.entityName,
         type: obs.type,
@@ -94,32 +237,72 @@ export async function compactDetail(
         lastAccessedAt: '',
         status: obs.status ?? 'active',
         source: obs.source ?? 'agent',
+        sourceDetail: obs.sourceDetail ?? '',
+        valueCategory: obs.valueCategory ?? '',
+        admissionState: obs.admissionState ?? '',
+        admissionReason: obs.admissionReason ?? '',
+        visibility: obs.visibility ?? 'project',
+        createdByAgentId: obs.createdByAgentId ?? '',
+        sharedWithAgentIds: JSON.stringify(obs.sharedWithAgentIds ?? []),
       });
+    } else {
+      missingRefs.push(ref);
+    }
+  }
+
+  if (missingRefs.length > 0) {
+    for (const ref of missingRefs) {
+      const fallbackDocs = await getObservationsByIds([ref.id], ref.projectId);
+      const doc = fallbackDocs[0];
+      if (doc && canReadObservation(doc, options.reader)) {
+        documentMap.set(toRefKey(ref), doc);
+        continue;
+      }
+      const stored = await getPersistedObservation(ref);
+      if (stored && canReadObservation(stored, options.reader)) {
+        documentMap.set(toRefKey(ref), observationToDocument(stored));
+      }
     }
   }
 
   // Build cross-reference map for all requested observations
-  const allObs = getAllObservations();
-  const crossRefMap = new Map<number, string[]>();
-  for (const id of ids) {
-    const obs = getObservation(id);
-    if (!obs) continue;
+  const allObs = filterReadableObservations(getAllObservations(), options.reader);
+  const crossRefMap = new Map<string, string[]>();
+  for (const ref of refs) {
+    const obs = getObservation(ref.id, ref.projectId);
+    const doc = documentMap.get(toRefKey(ref));
+    if (!obs && !doc) continue;
     const refs: string[] = [];
+    const projectIds = obs
+      ? new Set(await resolveAliases(obs.projectId).catch(() => [obs.projectId]))
+      : new Set<string>(doc?.projectId ? [doc.projectId] : []);
 
-    // Source badge
-    if (obs.source === 'git' && obs.commitHash) {
-      refs.push(`Source: git commit ${obs.commitHash.substring(0, 7)}`);
-    } else if (obs.source) {
+    // Repository / source line
+    if (obs?.source === 'git' && obs.commitHash) {
+      refs.push(`Repository: commit ${obs.commitHash.substring(0, 7)}`);
+    } else if (obs?.source && obs.source !== 'agent') {
       refs.push(`Source: ${obs.source}`);
+    } else if (doc?.source && doc.source !== 'agent') {
+      refs.push(`Source: ${doc.source}`);
     }
 
-    // Explicit relatedCommits
+    if (!obs) {
+      if (refs.length > 0 && doc) crossRefMap.set(doc.id, refs);
+      continue;
+    }
+
+    // Cited commits (explicit relatedCommits cross-references)
     if (obs.relatedCommits && obs.relatedCommits.length > 0) {
-      refs.push(`Related commits: ${obs.relatedCommits.map(h => h.substring(0, 7)).join(', ')}`);
+      refs.push(`Cited commits: ${obs.relatedCommits.map(h => h.substring(0, 7)).join(', ')}`);
       // Auto-find git memories for those commits
-      const gitMems = allObs.filter(o => o.source === 'git' && o.commitHash && obs.relatedCommits!.includes(o.commitHash));
+      const gitMems = allObs.filter(o =>
+        o.source === 'git' &&
+        projectIds.has(o.projectId) &&
+        o.commitHash &&
+        obs.relatedCommits!.includes(o.commitHash),
+      );
       for (const gm of gitMems) {
-        refs.push(`  → #${gm.id} 🟢 ${gm.title}`);
+        refs.push(`  → #${gm.id} [CHANGE] ${gm.title}`);
       }
     }
 
@@ -128,46 +311,168 @@ export async function compactDetail(
       refs.push(`Related entities: ${obs.relatedEntities.join(', ')}`);
     }
 
-    // Auto cross-reference: if this is a git memory, find reasoning memories for same entity
+    // Auto: if this is a git memory, find analysis (reasoning/decision) for same entity
     if (obs.source === 'git') {
-      const reasoning = allObs.filter(o =>
-        o.type === 'reasoning' && o.entityName === obs.entityName && o.id !== obs.id && o.status !== 'archived',
+      const analysis = allObs.filter(o =>
+        (o.type === 'reasoning' || o.type === 'decision') &&
+        projectIds.has(o.projectId) &&
+        o.entityName === obs.entityName && o.id !== obs.id && o.status !== 'archived',
       ).slice(0, 3);
-      if (reasoning.length > 0) {
-        refs.push('Related reasoning:');
-        for (const r of reasoning) {
-          refs.push(`  → #${r.id} 🧠 ${r.title}`);
+      if (analysis.length > 0) {
+        refs.push('Analysis:');
+        for (const r of analysis) {
+          refs.push(`  → #${r.id} ${r.type === 'reasoning' ? '[REASONING]' : '[DECISION]'} ${r.title}`);
         }
       }
     }
 
-    // Auto cross-reference: if this is a reasoning memory, find git memories for same entity
-    if (obs.type === 'reasoning') {
+    // Auto: if this is a reasoning/decision memory, find git evidence for same entity
+    if (obs.type === 'reasoning' || obs.type === 'decision') {
       const gitMems = allObs.filter(o =>
-        o.source === 'git' && o.entityName === obs.entityName && o.id !== obs.id && o.status !== 'archived',
+        o.source === 'git' &&
+        projectIds.has(o.projectId) &&
+        o.entityName === obs.entityName &&
+        o.id !== obs.id &&
+        o.status !== 'archived',
       ).slice(0, 3);
       if (gitMems.length > 0) {
-        refs.push('Related commits:');
+        refs.push('Repository evidence:');
         for (const g of gitMems) {
-          refs.push(`  → #${g.id} 🟢 ${g.title}`);
+          refs.push(`  → #${g.id} [CHANGE] ${g.title}`);
         }
       }
     }
 
-    if (refs.length > 0) crossRefMap.set(obs.id, refs);
+    if (refs.length > 0) crossRefMap.set(makeOramaObservationId(obs.projectId, obs.id), refs);
   }
 
-  const formattedParts = documents.map((doc: MemorixDocument) => {
-    let detail = formatObservationDetail(doc);
-    const refs = crossRefMap.get(doc.observationId);
-    if (refs && refs.length > 0) {
-      detail += '\n\nCross-references:\n' + refs.join('\n');
+  // Store observation results into slots by original index
+  for (let i = 0; i < obsRefsIndexed.length; i++) {
+    const { idx } = obsRefsIndexed[i];
+    const ref = refs[i];
+    const doc = documentMap.get(toRefKey(ref));
+    if (doc) {
+      slotDoc.set(idx, doc);
+      const obs = getObservation(doc.observationId, doc.projectId);
+      let detail = formatObservationDetail({
+        ...doc,
+        commitHash: obs?.commitHash,
+        relatedCommits: obs?.relatedCommits,
+      });
+      const xrefs = crossRefMap.get(doc.id);
+      if (xrefs && xrefs.length > 0) {
+        detail += '\n\nEvidence support:\n' + xrefs.join('\n');
+      }
+      slotFormatted.set(idx, detail);
     }
-    return detail;
-  });
+  }
 
-  const formatted = formattedParts.join('\n\n' + '═'.repeat(50) + '\n\n');
+  // Reassemble in original parsedRefs order
+  const allDocuments: MemorixDocument[] = [];
+  const allFormattedParts: string[] = [];
+  for (let i = 0; i < parsedRefs.length; i++) {
+    const doc = slotDoc.get(i);
+    const fmt = slotFormatted.get(i);
+    if (doc) allDocuments.push(doc);
+    if (fmt) allFormattedParts.push(fmt);
+  }
+
+  const formatted = allFormattedParts.join('\n\n' + '═'.repeat(50) + '\n\n');
   const totalTokens = countTextTokens(formatted);
 
-  return { documents, formatted, totalTokens };
+  return { documents: allDocuments, formatted, totalTokens };
+}
+
+async function getPersistedObservation(ref: ObservationRef) {
+  try {
+    const store = getObservationStore();
+    const all = await store.loadAll();
+    return all.find((obs) => obs.id === ref.id && (ref.projectId ? obs.projectId === ref.projectId : true));
+  } catch {
+    return undefined;
+  }
+}
+
+function observationToDocument(obs: ReturnType<typeof getAllObservations>[number]): MemorixDocument {
+  return {
+    id: makeOramaObservationId(obs.projectId, obs.id),
+    observationId: obs.id,
+    entityName: obs.entityName,
+    type: obs.type,
+    title: obs.title,
+    narrative: obs.narrative,
+    facts: obs.facts.join('\n'),
+    filesModified: obs.filesModified.join('\n'),
+    concepts: obs.concepts.join(', '),
+    attachments: (obs.attachments ?? []).map((attachment) => [
+      attachment.name,
+      attachment.modality,
+      attachment.mimeType,
+      attachment.url,
+    ].filter(Boolean).join(' ')).join('\n'),
+    tokens: obs.tokens,
+    createdAt: obs.createdAt,
+    projectId: obs.projectId,
+    accessCount: 0,
+    lastAccessedAt: '',
+    status: obs.status ?? 'active',
+    source: obs.source ?? 'agent',
+    sourceDetail: obs.sourceDetail ?? '',
+    valueCategory: obs.valueCategory ?? '',
+    admissionState: obs.admissionState ?? '',
+    admissionReason: obs.admissionReason ?? '',
+    visibility: obs.visibility ?? 'project',
+    createdByAgentId: obs.createdByAgentId ?? '',
+    sharedWithAgentIds: JSON.stringify(obs.sharedWithAgentIds ?? []),
+  };
+}
+
+/**
+ * Format a mini-skill detail view with provenance status.
+ */
+function formatMiniSkillDetail(skill: MiniSkill, provenanceStatus: ProvenanceStatus): string {
+  const lines: string[] = [];
+
+  lines.push(`S${skill.id} core ${skill.title}`);
+  lines.push('='.repeat(50));
+  lines.push(`Type: promoted knowledge (mini-skill)`);
+  lines.push(`Entity: ${skill.sourceEntity}`);
+  lines.push(`Project: ${skill.projectId}`);
+  lines.push(`Created: ${new Date(skill.createdAt).toLocaleString()}`);
+  lines.push(`Used: ${skill.usedCount} time(s)`);
+  lines.push(`Provenance: ${provenanceStatus}`);
+  lines.push('');
+  lines.push(`Instruction: ${redactCredentials(skill.instruction)}`);
+  lines.push(`Trigger: ${skill.trigger}`);
+
+  if (skill.facts.length > 0) {
+    lines.push('');
+    lines.push('Facts:');
+    for (const fact of skill.facts) {
+      lines.push(`- ${redactCredentials(fact)}`);
+    }
+  }
+
+  if (skill.tags.length > 0) {
+    lines.push('');
+    lines.push(`Tags: ${skill.tags.join(', ')}`);
+  }
+
+  // Show source observation IDs with status
+  if (skill.sourceObservationIds.length > 0) {
+    lines.push('');
+    lines.push(`Source observations: ${skill.sourceObservationIds.map(id => `#${id}`).join(', ')}`);
+  }
+
+  // Show snapshot summary if available
+  if (skill.sourceSnapshot) {
+    try {
+      const snapshot: SourceSnapshot = JSON.parse(skill.sourceSnapshot);
+      if (snapshot.observations && snapshot.observations.length > 0) {
+        lines.push(`Snapshot: ${snapshot.observations.length} observation(s), frozen at ${new Date(snapshot.promotedAt).toLocaleString()}`);
+      }
+    } catch { /* malformed snapshot — skip */ }
+  }
+
+  return lines.join('\n');
 }

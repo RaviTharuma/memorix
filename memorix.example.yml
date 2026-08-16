@@ -1,32 +1,46 @@
 # ============================================================
-# memorix.yml — Memorix Platform Configuration
+# memorix.yml — Memorix Configuration
 # ============================================================
+#
+# Two files, two roles:
+#   memorix.yml  → behavior settings (this file)
+#   .env         → secrets only (API keys) — see .env.example
 #
 # Place this file at:
 #   - Project root (./memorix.yml)  — project-specific settings
-#   - User home (~/.memorix/memorix.yml) — global defaults
+#   - User home (~/.memorix/memorix.yml) — global defaults (advanced)
 #
-# Priority: env vars > project memorix.yml > user memorix.yml > config.json > defaults
+# Priority: env > .env > project memorix.yml > user memorix.yml > defaults
 #
 # Docs: https://github.com/AVIDS2/memorix
 
 # ── LLM Configuration ────────────────────────────────────────
 # Used for smart dedup, fact extraction, and memory formation.
 # Optional — Memorix works without LLM (free heuristic mode).
+# API key goes in .env as MEMORIX_LLM_API_KEY
 llm:
   provider: openai          # openai, anthropic, openrouter, or custom endpoint
   model: gpt-4o-mini
-  # apiKey: sk-...          # Or set MEMORIX_LLM_API_KEY env var
   # baseUrl: https://api.openai.com/v1
 
-# ── Embedding / Vector Search ────────────────────────────────
+# ── Embedding / Vector Search ──────────────────────────────
 # Enables semantic search alongside BM25 fulltext.
+# API key goes in .env as MEMORIX_EMBEDDING_API_KEY.
+# For OpenRouter embedding endpoints, OPENROUTER_API_KEY is also accepted.
 embedding:
   provider: off             # off (default), api, fastembed, transformers, auto
   # model: text-embedding-3-small
-  # apiKey: sk-...          # Or set MEMORIX_EMBEDDING_API_KEY env var
-  # baseUrl: https://api.openai.com/v1
+  # baseUrl: https://openrouter.ai/api/v1
+  # model: qwen/qwen3-embedding-8b
   # dimensions: 1024        # Override auto-detected dimensions
+
+# ── Neural rerank (OmniRoute → Jina) ─────────────────────────
+# HTTP only. Never a local model. Never api.jina.ai.
+# Bearer inherits MEMORIX_LLM_API_KEY when apiKey is omitted.
+# rerank:
+#   provider: http
+#   model: jina-ai/jina-reranker-v3.5
+#   baseUrl: https://omniroute.jaguar-fish.ts.net/v1
 
 # ── Git-Memory Pipeline ──────────────────────────────────────
 # Automatically capture engineering knowledge from git commits.
@@ -39,9 +53,16 @@ git:
   # excludePatterns:        # File glob patterns — commits touching ONLY these are skipped
   #   - "*.lock"
   #   - "dist/**"
-  # noiseKeywords:          # Regex patterns — commits matching these subjects are skipped
-  #   - "^BOT:"             # Skip bot-generated commits
+  # noiseKeywords:          # Literal phrases (case-insensitive) — matching commits are skipped
+  #   - "bot:"              # Skip bot-generated commits
   #   - "auto-deploy"       # Skip CI deploy commits
+
+# ── CodeGraph Memory ──────────────────────────────────────────
+# Build an incremental local code map for task context. Large generated files
+# are skipped by default; lower this only when a repository needs it.
+# codegraph:
+#   # excludePatterns: ["vendor/**", "generated/**"]
+#   maxFileBytes: 2097152   # 2 MiB default per source file
 
 # ── Behavior Settings ────────────────────────────────────────
 behavior:

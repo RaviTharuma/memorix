@@ -12,11 +12,61 @@ export type HookEvent =
   | 'post_command'
   | 'post_tool'
   | 'pre_compact'
+  | 'post_compact'
   | 'session_end'
   | 'post_response';
 
+/** Native compact metadata exposed by a host hook or package extension. */
+export interface NativeCompactionMetadata {
+  reason?: 'manual' | 'auto' | 'unknown';
+  sourceKey?: string;
+  summary?: string;
+  tokensBefore?: number;
+  firstKeptEntryId?: string;
+  details?: Record<string, unknown>;
+}
+
 /** Supported agent identifiers */
-export type AgentName = 'claude' | 'copilot' | 'windsurf' | 'cursor' | 'kiro' | 'codex' | 'antigravity' | 'opencode' | 'trae';
+export type AgentName =
+  | 'claude'
+  | 'copilot'
+  | 'windsurf'
+  | 'cursor'
+  | 'kiro'
+  | 'codex'
+  | 'codebuddy'
+  | 'antigravity'
+  | 'gemini-cli'
+  | 'openclaw'
+  | 'hermes'
+  | 'opencode'
+  | 'trae'
+  | 'dsh'
+  | 'pi'
+  | 'omp';
+
+/** Support tier for hook agents */
+export type SupportTier = 'core' | 'extended' | 'community';
+
+/** Agent support tier mapping */
+export const AGENT_SUPPORT_TIER: Record<AgentName, SupportTier> = {
+  claude: 'core',
+  windsurf: 'core',
+  cursor: 'core',
+  copilot: 'extended',
+  kiro: 'extended',
+  codex: 'extended',
+  codebuddy: 'community',
+  'gemini-cli': 'community',
+  openclaw: 'community',
+  hermes: 'community',
+  opencode: 'community',
+  trae: 'community',
+  dsh: 'community',
+  pi: 'community',
+  omp: 'community',
+  antigravity: 'community',
+};
 
 /** Normalized hook input — agent-agnostic */
 export interface NormalizedHookInput {
@@ -55,6 +105,12 @@ export interface NormalizedHookInput {
 
   /** Full transcript path (for pre_compact / session_end) */
   transcriptPath?: string;
+
+  /** Host-provided SessionStart source (for example, `compact` in Codex). */
+  sessionStartReason?: string;
+
+  /** Native compaction metadata when the host makes it available. */
+  compaction?: NativeCompactionMetadata;
 
   /** Raw agent-specific payload (preserved for debugging) */
   raw: Record<string, unknown>;

@@ -5,7 +5,7 @@
  * Patterns from mcp-memory-service + MemCP.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -13,12 +13,16 @@ import {
   calculateRelevance,
   rankByRelevance,
   isImmune,
+  getImmunityReason,
   getRetentionZone,
   getArchiveCandidates,
   getRetentionSummary,
   getImportanceLevel,
   archiveExpired,
+  archiveExpiredBatch,
 } from '../../src/memory/retention.js';
+import { initObservationStore, resetObservationStore, getObservationStore } from '../../src/store/obs-store.js';
+import { closeAllDatabases } from '../../src/store/sqlite-db.js';
 import type { MemorixDocument } from '../../src/types.js';
 
 function makeDoc(overrides: Partial<MemorixDocument> = {}): MemorixDocument {
@@ -37,6 +41,10 @@ function makeDoc(overrides: Partial<MemorixDocument> = {}): MemorixDocument {
     projectId: 'test',
     accessCount: 0,
     lastAccessedAt: '',
+    status: 'active',
+    source: 'agent',
+    sourceDetail: '',
+    valueCategory: '',
     ...overrides,
   };
 }
@@ -95,7 +103,8 @@ describe('Retention & Decay', () => {
       const oldDate = new Date();
       oldDate.setDate(oldDate.getDate() - 365);
       const doc = makeDoc({
-        type: 'decision', // high importance → immune
+        type: 'decision',
+        valueCategory: 'core', // core valueCategory → immune
         createdAt: oldDate.toISOString(),
       });
       const score = calculateRelevance(doc);
@@ -105,9 +114,24 @@ describe('Retention & Decay', () => {
   });
 
   describe('isImmune', () => {
-    it('should protect high importance observations', () => {
-      expect(isImmune(makeDoc({ type: 'gotcha' }))).toBe(true);
-      expect(isImmune(makeDoc({ type: 'decision' }))).toBe(true);
+    it('should not protect high importance observations by type alone (P10 tightening)', () => {
+      expect(isImmune(makeDoc({ type: 'gotcha' }))).toBe(false);
+      expect(isImmune(makeDoc({ type: 'decision' }))).toBe(false);
+    });
+
+    it('should protect core valueCategory observations', () => {
+      expect(isImmune(makeDoc({ type: 'gotcha', valueCategory: 'core' }))).toBe(true);
+      expect(isImmune(makeDoc({ type: 'discovery', valueCategory: 'core' }))).toBe(true);
+    });
+
+    it('does not misreport an unqualified automatic core candidate as immune', () => {
+      const candidate = makeDoc({
+        type: 'decision',
+        valueCategory: 'core',
+        admissionState: 'candidate',
+      });
+      expect(isImmune(candidate)).toBe(false);
+      expect(getImmunityReason(candidate)).toBeNull();
     });
 
     it('should protect frequently accessed observations', () => {
@@ -178,7 +202,7 @@ describe('Retention & Decay', () => {
     it('should keep immune observations active regardless of age', () => {
       const oldDate = new Date();
       oldDate.setDate(oldDate.getDate() - 400);
-      const doc = makeDoc({ type: 'decision', createdAt: oldDate.toISOString() });
+      const doc = makeDoc({ type: 'decision', valueCategory: 'core', createdAt: oldDate.toISOString() });
       expect(getRetentionZone(doc)).toBe('active');
     });
   });
@@ -206,7 +230,7 @@ describe('Retention & Decay', () => {
       const oldDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
 
       const docs = [
-        makeDoc({ observationId: 1, type: 'decision', createdAt: now.toISOString() }), // active + immune
+        makeDoc({ observationId: 1, type: 'decision', valueCategory: 'core', createdAt: now.toISOString() }), // active + immune (core)
         makeDoc({ observationId: 2, type: 'session-request', createdAt: oldDate.toISOString() }), // archive-candidate
         makeDoc({ observationId: 3, type: 'how-it-works', createdAt: now.toISOString() }), // active
       ];
@@ -226,6 +250,8 @@ describe('Retention & Decay', () => {
     });
 
     afterEach(async () => {
+      resetObservationStore();
+      closeAllDatabases();
       await fs.rm(tmpDir, { recursive: true, force: true });
     });
 
@@ -240,18 +266,19 @@ describe('Retention & Decay', () => {
       ];
 
       await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
 
       const result = await archiveExpired(tmpDir, now);
       expect(result.archived).toBe(1);
       expect(result.remaining).toBe(1);
 
-      // Active observations should remain
-      const remaining = JSON.parse(await fs.readFile(path.join(tmpDir, 'observations.json'), 'utf-8'));
-      expect(remaining).toHaveLength(1);
-      expect(remaining[0].id).toBe(2);
-
-      // Archived observations should be in archive file
-      const archived = JSON.parse(await fs.readFile(path.join(tmpDir, 'observations.archived.json'), 'utf-8'));
+      // All observations remain in store, but archived ones have status='archived'
+      const all = await getObservationStore().loadAll();
+      expect(all).toHaveLength(2);
+      const active = all.filter((o: any) => (o.status ?? 'active') === 'active');
+      const archived = all.filter((o: any) => o.status === 'archived');
+      expect(active).toHaveLength(1);
+      expect(active[0].id).toBe(2);
       expect(archived).toHaveLength(1);
       expect(archived[0].id).toBe(1);
     });
@@ -263,30 +290,140 @@ describe('Retention & Decay', () => {
       ];
 
       await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
 
       const result = await archiveExpired(tmpDir, now);
       expect(result.archived).toBe(0);
       expect(result.remaining).toBe(1);
     });
 
-    it('should append to existing archive file', async () => {
+    it('should set status=archived on expired observations (in-place)', async () => {
       const now = new Date();
       const expiredDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
 
-      // Pre-existing archive
-      await fs.writeFile(path.join(tmpDir, 'observations.archived.json'), JSON.stringify([{ id: 0, title: 'Previously archived' }]));
-
       const observations = [
         { id: 1, entityName: 'a', type: 'session-request', title: 'Expired', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'test' },
+        { id: 2, entityName: 'b', type: 'decision', title: 'Active', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: now.toISOString(), projectId: 'test' },
       ];
       await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
 
       await archiveExpired(tmpDir, now);
 
-      const archived = JSON.parse(await fs.readFile(path.join(tmpDir, 'observations.archived.json'), 'utf-8'));
-      expect(archived).toHaveLength(2);
-      expect(archived[0].id).toBe(0); // previously archived
-      expect(archived[1].id).toBe(1); // newly archived
+      // Both observations stay in the store; expired one has status='archived'
+      const all = await getObservationStore().loadAll();
+      expect(all).toHaveLength(2);
+      const obs1 = all.find((o: any) => o.id === 1);
+      expect(obs1?.status).toBe('archived');
+      const obs2 = all.find((o: any) => o.id === 2);
+      expect((obs2 as any)?.status ?? 'active').toBe('active');
+    });
+
+    it('should respect access-based immunity when accessMap is provided', async () => {
+      const now = new Date();
+      const expiredDate = new Date(now.getTime() - 200 * 24 * 60 * 60 * 1000).toISOString();
+
+      const observations = [
+        { id: 1, entityName: 'a', type: 'decision', title: 'Frequently accessed', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'test' },
+      ];
+
+      await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
+
+      const accessMap = new Map([
+        [1, { accessCount: 3, lastAccessedAt: '' }],
+      ]);
+
+      const result = await archiveExpired(tmpDir, now, accessMap);
+      expect(result.archived).toBe(0);
+      expect(result.remaining).toBe(1);
+    });
+
+    it('archives only the requested project in a shared flat store', async () => {
+      const now = new Date();
+      const expiredDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
+      const observations = [
+        { id: 1, entityName: 'a', type: 'session-request', title: 'A expired', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-a' },
+        { id: 2, entityName: 'b', type: 'session-request', title: 'B expired', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-b' },
+      ];
+      await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
+
+      const result = await archiveExpired(tmpDir, now, undefined, 'project-a');
+
+      expect(result).toEqual({ archived: 1, remaining: 0 });
+      const all = await getObservationStore().loadAll();
+      expect(all.find((observation) => observation.id === 1)?.status).toBe('archived');
+      expect(all.find((observation) => observation.id === 2)?.status ?? 'active').toBe('active');
+    });
+
+    it('does not archive private observations for an unbound project reader', async () => {
+      const now = new Date();
+      const expiredDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
+      const observations = [
+        { id: 1, entityName: 'a', type: 'session-request', title: 'Public expired', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-a' },
+        { id: 2, entityName: 'b', type: 'session-request', title: 'Private expired', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-a', visibility: 'personal', createdByAgentId: 'agent-a' },
+      ];
+      await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
+
+      const result = await archiveExpired(tmpDir, now, undefined, 'project-a', { projectId: 'project-a' });
+
+      expect(result).toEqual({ archived: 1, remaining: 0 });
+      const all = await getObservationStore().loadAll();
+      expect(all.find((observation) => observation.id === 1)?.status).toBe('archived');
+      expect(all.find((observation) => observation.id === 2)?.status ?? 'active').toBe('active');
+    });
+
+    it('archives a project in bounded ID-cursor batches without loading the shared table', async () => {
+      const now = new Date();
+      const expiredDate = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000).toISOString();
+      const observations = [
+        { id: 1, entityName: 'a', type: 'decision', title: 'Recent A', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: now.toISOString(), projectId: 'project-a' },
+        { id: 2, entityName: 'b', type: 'session-request', title: 'Expired A one', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-a' },
+        { id: 3, entityName: 'c', type: 'decision', title: 'Recent A two', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: now.toISOString(), projectId: 'project-a' },
+        { id: 4, entityName: 'd', type: 'session-request', title: 'Expired A two', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-a' },
+        { id: 5, entityName: 'e', type: 'session-request', title: 'Expired B', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: expiredDate, projectId: 'project-b' },
+      ];
+      await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
+
+      const rawLoadAll = vi.spyOn(getObservationStore() as any, 'rawLoadAll');
+      const first = await archiveExpiredBatch(tmpDir, {
+        projectId: 'project-a',
+        limit: 2,
+        referenceTime: now,
+      });
+      const second = await archiveExpiredBatch(tmpDir, {
+        projectId: 'project-a',
+        limit: 2,
+        afterId: first.nextCursor,
+        referenceTime: now,
+      });
+
+      expect(first).toEqual({ archived: 1, scanned: 2, nextCursor: 2 });
+      expect(second).toEqual({ archived: 1, scanned: 2 });
+      expect(rawLoadAll).not.toHaveBeenCalled();
+
+      const all = await getObservationStore().loadAll();
+      expect(all.find((observation) => observation.id === 2)?.status).toBe('archived');
+      expect(all.find((observation) => observation.id === 4)?.status).toBe('archived');
+      expect(all.find((observation) => observation.id === 5)?.status ?? 'active').toBe('active');
+    });
+
+    it('does not advance storage generation for a scanned page with no archive candidates', async () => {
+      const now = new Date();
+      const observations = [
+        { id: 1, entityName: 'a', type: 'decision', title: 'Recent', narrative: '', facts: [], filesModified: [], concepts: [], tokens: 10, createdAt: now.toISOString(), projectId: 'project-a' },
+      ];
+      await fs.writeFile(path.join(tmpDir, 'observations.json'), JSON.stringify(observations));
+      await initObservationStore(tmpDir);
+
+      const generationBefore = getObservationStore().getGeneration();
+      const result = await archiveExpiredBatch(tmpDir, { projectId: 'project-a', referenceTime: now });
+
+      expect(result).toEqual({ archived: 0, scanned: 1 });
+      expect(getObservationStore().getGeneration()).toBe(generationBefore);
     });
   });
 });

@@ -10,52 +10,61 @@ export default defineCommand({
     name: 'status',
     description: 'Show project info and rules sync status',
   },
-  run: async () => {
+  args: {
+    json: { type: 'boolean', description: 'Emit machine-readable JSON output' },
+  },
+  run: async ({ args }) => {
+    const asJson = !!args.json;
     const { detectProject } = await import('../../project/detector.js');
     const { RulesSyncer } = await import('../../rules/syncer.js');
     const { getProjectDataDir } = await import('../../store/persistence.js');
     const { getEmbeddingProvider } = await import('../../embedding/provider.js');
+    const { getResolvedConfig, getResolvedAgentLane } = await import('../../config/resolved-config.js');
     const { existsSync, readFileSync } = await import('node:fs');
-    const { join } = await import('node:path');
-
-    p.intro('memorix status');
 
     const project = detectProject();
     if (!project) {
-      p.log.error('No .git found — not a project directory. Run "git init" first.');
+      const message = 'Memorix requires a git repo to establish project identity. Run `git init` in this workspace first.';
+      if (asJson) {
+        console.log(JSON.stringify({
+          ok: false,
+          error: { code: 'NO_GIT_REPOSITORY', message },
+        }, null, 2));
+      } else {
+        p.intro('memorix status');
+        p.log.error(message);
+      }
       return;
     }
+
+    // Load .env BEFORE any process.env reads or provider initialization (#46)
+    const { loadDotenv } = await import('../../config/dotenv-loader.js');
+    loadDotenv(project.rootPath);
+
     const dataDir = await getProjectDataDir(project.id);
 
-    // Count observations
+    // Count observations for the CURRENT project only (not global total)
     let obsCount = 0;
+    let activeCount = 0;
     try {
-      const obsFile = join(dataDir, 'observations.json');
-      if (existsSync(obsFile)) {
-        const data = JSON.parse(readFileSync(obsFile, 'utf-8'));
-        obsCount = Array.isArray(data) ? data.length : 0;
-      }
+      const { initObservationStore, getObservationStore } = await import('../../store/obs-store.js');
+      await initObservationStore(dataDir);
+      const store = getObservationStore();
+      const { filterReadableObservations } = await import('../../memory/visibility.js');
+      const projectObs = filterReadableObservations(await store.loadAll(), { projectId: project.id });
+      obsCount = projectObs.length;
+      activeCount = projectObs.filter(o => (o.status ?? 'active') === 'active').length;
     } catch { /* ignore */ }
-
-    p.note(
-      [
-        `Name:         ${project.name}`,
-        `ID:           ${project.id}`,
-        `Root:         ${project.rootPath}`,
-        `Git remote:   ${project.gitRemote || 'none'}`,
-        `Data dir:     ${dataDir}`,
-        `Observations: ${obsCount}`,
-      ].join('\n'),
-      'Project',
-    );
 
     // Embedding / vector search status
     let embeddingStatus = 'None (fulltext/BM25 only)';
     let embeddingHint = '';
+    let embeddingProvider: { name: string; dimensions: number } | null = null;
     const embeddingMode = process.env.MEMORIX_EMBEDDING?.toLowerCase()?.trim() || 'off';
     try {
       const provider = await getEmbeddingProvider();
       if (provider) {
+        embeddingProvider = provider;
         embeddingStatus = `${provider.name} (${provider.dimensions}d)`;
         if (embeddingMode === 'api') {
           const model = process.env.MEMORIX_EMBEDDING_MODEL || 'text-embedding-3-small';
@@ -65,36 +74,40 @@ export default defineCommand({
         if (embeddingMode === 'api') {
           embeddingHint = '\n  WARN: API embedding configured but failed to connect — check API key/URL';
         } else {
-          embeddingHint = '\n  Hint: Set MEMORIX_EMBEDDING=api for best quality, or install fastembed for local';
+          embeddingHint = '\n  Hint: Set MEMORIX_EMBEDDING=api for best quality, or install @huggingface/transformers or fastembed for local';
         }
       }
     } catch {
-      embeddingHint = '\n  Hint: Set MEMORIX_EMBEDDING=api for best quality, or install fastembed for local';
+      embeddingHint = '\n  Hint: Set MEMORIX_EMBEDDING=api for best quality, or install @huggingface/transformers or fastembed for local';
     }
 
-    p.note(
-      `Search:    BM25 fulltext (Orama)\n` +
-      `Embedding: ${embeddingStatus}${embeddingHint}`,
-      'Search Engine',
-    );
-
-    // memorix.yml config status
+    // ── TOML-first Config Snapshot ──
+    let configuration: Record<string, unknown> | null = null;
+    let configNote: string | null = null;
     try {
-      const { loadYamlConfig } = await import('../../config/yaml-loader.js');
-      const yml = loadYamlConfig(project.rootPath);
-      const ymlParts: string[] = [];
-
-      // Check file locations
-      const projectYml = join(project.rootPath, 'memorix.yml');
-      const userYml = join((await import('node:os')).homedir(), '.memorix', 'memorix.yml');
-      if (existsSync(projectYml)) ymlParts.push(`Project:   ${projectYml}`);
-      if (existsSync(userYml)) ymlParts.push(`User:      ${userYml}`);
-      if (ymlParts.length === 0) ymlParts.push('Not found  (run "memorix init" to create)');
-
-      if (yml.llm?.provider) ymlParts.push(`LLM:       ${yml.llm.provider}/${yml.llm.model ?? 'default'}`);
-      if (yml.embedding?.provider && yml.embedding.provider !== 'off') ymlParts.push(`Embedding: ${yml.embedding.provider}/${yml.embedding.model ?? 'default'}`);
-      if (yml.git?.autoHook) ymlParts.push(`Git hook:  auto-install enabled`);
-      if (yml.behavior?.formationMode) ymlParts.push(`Formation: ${yml.behavior.formationMode}`);
+      const { getLoadedEnvFiles } = await import('../../config/dotenv-loader.js');
+      const resolved = getResolvedConfig({ projectRoot: project.rootPath });
+      const agent = getResolvedAgentLane({ projectRoot: project.rootPath });
+      const diagLines: string[] = [];
+      diagLines.push('Active config sources:');
+      diagLines.push(`  TOML:        ${formatSourceList(resolved.sources.toml)}`);
+      diagLines.push(`  Compatibility: ${formatSourceList(resolved.sources.legacy)}`);
+      const loadedEnv = getLoadedEnvFiles();
+      if (loadedEnv.length > 0) {
+        diagLines.push(`  Loaded .env: ${loadedEnv.join(', ')}`);
+      }
+      if (resolved.sources.env.length > 0) {
+        diagLines.push(`  Env overrides: ${resolved.sources.env.join(', ')}`);
+      }
+      diagLines.push('');
+      diagLines.push('Resolved lanes:');
+      diagLines.push(`  Agent lane:      ${formatLane(agent.provider, agent.model, agent.baseUrl, agent.apiKey)}`);
+      diagLines.push(`  Memory LLM lane: ${formatLane(resolved.memory.llm.provider, resolved.memory.llm.model, resolved.memory.llm.baseUrl, resolved.memory.llm.apiKey)}`);
+      diagLines.push(`  Embedding lane:  ${formatLane(resolved.embedding.provider, resolved.embedding.model, resolved.embedding.baseUrl, resolved.embedding.apiKey)}`);
+      diagLines.push(`  Rerank lane:     ${formatLane(resolved.rerank.provider, resolved.rerank.model, resolved.rerank.baseUrl, resolved.rerank.apiKey)}`);
+      diagLines.push(`  Memory behavior: inject=${resolved.memory.inject ?? 'default'}, formation=${resolved.memory.formation ?? 'default'}, autoCleanup=${resolved.memory.autoCleanup ?? 'default'}`);
+      diagLines.push(`  Git behavior:    autoHook=${resolved.git.autoHook ?? 'default'}, ingestOnCommit=${resolved.git.ingestOnCommit ?? 'default'}, maxDiffSize=${resolved.git.maxDiffSize ?? 'default'}, skipMergeCommits=${resolved.git.skipMergeCommits ?? 'default'}`);
+      diagLines.push(`  Server:          transport=${resolved.server.transport ?? 'default'}, dashboard=${resolved.server.dashboard ?? 'default'}, dashboardPort=${resolved.server.dashboardPort ?? 'default'}`);
 
       // Git hook status (worktree-safe)
       try {
@@ -103,19 +116,128 @@ export default defineCommand({
         if (resolved && existsSync(resolved.hookPath)) {
           const hookContent = readFileSync(resolved.hookPath, 'utf-8');
           if (hookContent.includes('# [memorix-git-hook]')) {
-            ymlParts.push(`Git hook:  installed ✅`);
+            diagLines.push(`  Git hook:      installed [OK]`);
+          } else {
+            diagLines.push(`  Git hook:      not installed (run "memorix git-hook")`);
           }
-        } else if (!yml.git?.autoHook) {
-          ymlParts.push(`Git hook:  not installed (run "memorix git-hook")`);
+        } else {
+          diagLines.push(`  Git hook:      not installed (run "memorix git-hook")`);
         }
       } catch { /* best effort */ }
 
-      p.note(ymlParts.join('\n'), 'Configuration');
+      if (resolved.sources.toml.length === 0) {
+        diagLines.push('');
+        diagLines.push('[TIP] Run "memorix init" to create TOML config');
+      }
+
+      configNote = diagLines.join('\n');
+      configuration = {
+        sources: {
+          toml: resolved.sources.toml,
+          compatibility: resolved.sources.legacy,
+          dotenv: loadedEnv,
+          environment: resolved.sources.env,
+        },
+        lanes: {
+          agent: summarizeLane(agent.provider, agent.model, agent.baseUrl, agent.apiKey),
+          memoryLlm: summarizeLane(resolved.memory.llm.provider, resolved.memory.llm.model, resolved.memory.llm.baseUrl, resolved.memory.llm.apiKey),
+          embedding: summarizeLane(resolved.embedding.provider, resolved.embedding.model, resolved.embedding.baseUrl, resolved.embedding.apiKey),
+          rerank: summarizeLane(resolved.rerank.provider, resolved.rerank.model, resolved.rerank.baseUrl, resolved.rerank.apiKey),
+        },
+        memory: {
+          inject: resolved.memory.inject ?? 'default',
+          formation: resolved.memory.formation ?? 'default',
+          autoCleanup: resolved.memory.autoCleanup ?? 'default',
+        },
+        git: {
+          autoHook: resolved.git.autoHook ?? 'default',
+          ingestOnCommit: resolved.git.ingestOnCommit ?? 'default',
+          maxDiffSize: resolved.git.maxDiffSize ?? 'default',
+          skipMergeCommits: resolved.git.skipMergeCommits ?? 'default',
+        },
+        server: {
+          transport: resolved.server.transport ?? 'default',
+          dashboard: resolved.server.dashboard ?? 'default',
+          dashboardPort: resolved.server.dashboardPort ?? 'default',
+        },
+      };
     } catch { /* best effort */ }
 
     const syncer = new RulesSyncer(project.rootPath);
     const status = await syncer.syncStatus();
 
+    // Count by source
+    const memorySources: string[] = [];
+    try {
+      const { initObservationStore, getObservationStore } = await import('../../store/obs-store.js');
+      await initObservationStore(dataDir);
+      const store = getObservationStore();
+      const { filterReadableObservations } = await import('../../memory/visibility.js');
+      const allObs = filterReadableObservations(await store.loadAll(), { projectId: project.id });
+      const gitCount = allObs.filter(o => o.source === 'git').length;
+      const reasoningCount = allObs.filter(o => o.type === 'reasoning').length;
+      if (gitCount > 0 || reasoningCount > 0) {
+        if (gitCount > 0) memorySources.push(`Git memories: ${gitCount}`);
+        if (reasoningCount > 0) memorySources.push(`Reasoning traces: ${reasoningCount}`);
+      }
+    } catch { /* best effort */ }
+
+    if (asJson) {
+      console.log(JSON.stringify({
+        ok: true,
+        project: {
+          name: project.name,
+          id: project.id,
+          rootPath: project.rootPath,
+          gitRemote: project.gitRemote ?? null,
+          dataDir,
+        },
+        observations: { total: obsCount, active: activeCount },
+        search: {
+          fulltext: 'orama-bm25',
+          embedding: {
+            mode: embeddingMode,
+            available: embeddingProvider !== null,
+            provider: embeddingProvider?.name ?? null,
+            dimensions: embeddingProvider?.dimensions ?? null,
+            status: embeddingStatus,
+            hint: embeddingHint.trim() || null,
+          },
+        },
+        configuration,
+        rules: {
+          sources: status.sources,
+          total: status.totalRules,
+          unique: status.uniqueRules,
+          conflicts: status.conflicts.map((conflict) => ({
+            left: { source: conflict.ruleA.source, id: conflict.ruleA.id },
+            right: { source: conflict.ruleB.source, id: conflict.ruleB.id },
+            reason: conflict.reason,
+          })),
+        },
+        memorySources,
+      }, null, 2));
+      return;
+    }
+
+    p.intro('memorix status');
+    p.note(
+      [
+        `Name:         ${project.name}`,
+        `ID:           ${project.id}`,
+        `Root:         ${project.rootPath}`,
+        `Git remote:   ${project.gitRemote || 'none'}`,
+        `Data dir:     ${dataDir}`,
+        `Observations: ${obsCount} (${activeCount} active)`,
+      ].join('\n'),
+      'Project',
+    );
+    p.note(
+      `Search:    BM25 fulltext (Orama)\n` +
+      `Embedding: ${embeddingStatus}${embeddingHint}`,
+      'Search Engine',
+    );
+    if (configNote) p.note(configNote, 'Configuration');
     p.note(
       [
         `Sources:      ${status.sources.join(', ') || 'none detected'}`,
@@ -130,7 +252,7 @@ export default defineCommand({
       p.log.warn('Conflicts detected:');
       for (const c of status.conflicts) {
         p.log.warn(`  ${c.ruleA.source}:${c.ruleA.id} vs ${c.ruleB.source}:${c.ruleB.id}`);
-        p.log.warn(`  → ${c.reason}`);
+        p.log.warn(`  -> ${c.reason}`);
       }
     }
 
@@ -138,22 +260,31 @@ export default defineCommand({
       p.log.info('No rule files found. Create .cursorrules, CLAUDE.md, or .windsurfrules to get started.');
     }
 
-    // Count by source
-    try {
-      const obsFile = join(dataDir, 'observations.json');
-      if (existsSync(obsFile)) {
-        const allObs = JSON.parse(readFileSync(obsFile, 'utf-8')) as Array<{ source?: string; type?: string }>;
-        const gitCount = allObs.filter(o => o.source === 'git').length;
-        const reasoningCount = allObs.filter(o => o.type === 'reasoning').length;
-        if (gitCount > 0 || reasoningCount > 0) {
-          const parts: string[] = [];
-          if (gitCount > 0) parts.push(`Git memories: ${gitCount}`);
-          if (reasoningCount > 0) parts.push(`Reasoning traces: ${reasoningCount}`);
-          p.note(parts.join('\n'), 'Memory Sources');
-        }
-      }
-    } catch { /* best effort */ }
+    if (memorySources.length > 0) p.note(memorySources.join('\n'), 'Memory Sources');
 
     p.outro('Done');
   },
 });
+
+function formatSourceList(paths: string[]): string {
+  return paths.length > 0 ? paths.join(', ') : 'none';
+}
+
+function formatLane(provider?: string, model?: string, baseUrl?: string, apiKey?: string): string {
+  const parts = [
+    provider ?? 'unset',
+    model ?? 'unset',
+  ];
+  if (baseUrl) parts.push(`baseUrl=${baseUrl}`);
+  parts.push(`apiKey=${apiKey ? '<redacted>' : 'not set'}`);
+  return parts.join(' / ');
+}
+
+function summarizeLane(provider?: string, model?: string, baseUrl?: string, apiKey?: string): Record<string, string | boolean | null> {
+  return {
+    provider: provider ?? null,
+    model: model ?? null,
+    baseUrl: baseUrl ?? null,
+    apiKeyConfigured: Boolean(apiKey),
+  };
+}

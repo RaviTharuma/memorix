@@ -1,7 +1,7 @@
 /**
  * Export/Import Engine
  *
- * Enables team collaboration by exporting and importing Memorix data.
+ * Enables coordination continuity by exporting and importing Memorix data.
  *
  * Export formats:
  * - JSON: Full fidelity, machine-readable
@@ -10,11 +10,11 @@
  * Import: JSON format only (full fidelity restore)
  */
 
-import type { Observation } from '../types.js';
+import type { Observation, ObservationReader } from '../types.js';
 import type { Session } from '../types.js';
-import { loadObservationsJson, saveObservationsJson, loadIdCounter, saveIdCounter } from '../store/persistence.js';
-import { loadSessionsJson, saveSessionsJson } from '../store/persistence.js';
-import { withFileLock } from '../store/file-lock.js';
+import { filterReadableObservations } from './visibility.js';
+import { getObservationStore } from '../store/obs-store.js';
+import { getSessionStore } from '../store/session-store.js';
 
 /** Export package structure */
 export interface MemorixExport {
@@ -31,9 +31,9 @@ export interface MemorixExport {
 }
 
 const OBSERVATION_ICONS: Record<string, string> = {
-  'session-request': '🎯', 'gotcha': '🔴', 'problem-solution': '🟡',
-  'how-it-works': '🔵', 'what-changed': '🟢', 'discovery': '🟣',
-  'why-it-exists': '🟠', 'decision': '🟤', 'trade-off': '⚖️',
+  'session-request': '[SESSION]', 'gotcha': '[GOTCHA]', 'problem-solution': '[FIX]',
+  'how-it-works': '[INFO]', 'what-changed': '[CHANGE]', 'discovery': '[DISCOVERY]',
+  'why-it-exists': '[WHY]', 'decision': '[DECISION]', 'trade-off': '[TRADEOFF]',
 };
 
 /**
@@ -42,11 +42,18 @@ const OBSERVATION_ICONS: Record<string, string> = {
 export async function exportAsJson(
   projectDir: string,
   projectId: string,
+  reader?: ObservationReader,
 ): Promise<MemorixExport> {
-  const allObs = (await loadObservationsJson(projectDir)) as Observation[];
-  const allSessions = (await loadSessionsJson(projectDir)) as Session[];
+  const store = getObservationStore();
+  const allObs = await store.loadAll();
+  const allSessions = await getSessionStore().loadAll();
 
-  const projectObs = allObs.filter(o => o.projectId === projectId);
+  // Agent-facing callers supply a reader; trusted maintenance callers may
+  // intentionally omit it for a complete local backup or migration.
+  const projectObs = filterReadableObservations(
+    allObs.filter(o => o.projectId === projectId),
+    reader,
+  );
   const projectSessions = allSessions.filter(s => s.projectId === projectId);
 
   // Type breakdown
@@ -75,8 +82,9 @@ export async function exportAsJson(
 export async function exportAsMarkdown(
   projectDir: string,
   projectId: string,
+  reader?: ObservationReader,
 ): Promise<string> {
-  const data = await exportAsJson(projectDir, projectId);
+  const data = await exportAsJson(projectDir, projectId, reader);
   const lines: string[] = [];
 
   lines.push(`# Memorix Export: ${projectId}`);
@@ -88,7 +96,7 @@ export async function exportAsMarkdown(
   if (Object.keys(data.stats.typeBreakdown).length > 0) {
     lines.push('## Type Distribution');
     for (const [type, count] of Object.entries(data.stats.typeBreakdown).sort((a, b) => b[1] - a[1])) {
-      const icon = OBSERVATION_ICONS[type] ?? '❓';
+      const icon = OBSERVATION_ICONS[type] ?? '[UNKNOWN]';
       lines.push(`- ${icon} ${type}: ${count}`);
     }
     lines.push('');
@@ -98,7 +106,7 @@ export async function exportAsMarkdown(
   if (data.sessions.length > 0) {
     lines.push('## Sessions');
     for (const s of data.sessions) {
-      const status = s.status === 'active' ? '🟢' : '✅';
+      const status = s.status === 'active' ? '[CHANGE]' : '[OK]';
       const agent = s.agent ? ` [${s.agent}]` : '';
       lines.push(`### ${status} ${s.id}${agent}`);
       lines.push(`Started: ${s.startedAt}${s.endedAt ? ` | Ended: ${s.endedAt}` : ''}`);
@@ -121,7 +129,7 @@ export async function exportAsMarkdown(
   for (const [entity, observations] of byEntity) {
     lines.push(`### ${entity}`);
     for (const obs of observations) {
-      const icon = OBSERVATION_ICONS[obs.type] ?? '❓';
+      const icon = OBSERVATION_ICONS[obs.type] ?? '[UNKNOWN]';
       lines.push(`#### ${icon} #${obs.id} ${obs.title}`);
       lines.push(`Type: ${obs.type} | Created: ${obs.createdAt}${obs.topicKey ? ` | Topic: ${obs.topicKey}` : ''}${obs.revisionCount && obs.revisionCount > 1 ? ` | Rev: ${obs.revisionCount}` : ''}`);
       lines.push('');
@@ -154,10 +162,12 @@ export async function importFromJson(
   let sessionsImported = 0;
   let skipped = 0;
 
-  await withFileLock(projectDir, async () => {
-    const existingObs = (await loadObservationsJson(projectDir)) as Observation[];
-    const existingSessions = (await loadSessionsJson(projectDir)) as Session[];
-    let nextId = await loadIdCounter(projectDir);
+  const store = getObservationStore();
+  await store.atomic(async (tx) => {
+    const existingObs = await tx.loadAll();
+    const sessionStore = getSessionStore();
+    const existingSessions = await sessionStore.loadAll();
+    let nextId = await tx.loadIdCounter();
 
     // Build set of existing topicKey+projectId for dedup
     const existingTopicKeys = new Set(
@@ -165,6 +175,7 @@ export async function importFromJson(
         .filter(o => o.topicKey)
         .map(o => `${o.projectId}::${o.topicKey}`),
     );
+    const observationsToInsert: Observation[] = [];
 
     // Import observations
     for (const obs of data.observations) {
@@ -176,6 +187,7 @@ export async function importFromJson(
 
       const newObs = { ...obs, id: nextId++ };
       existingObs.push(newObs);
+      observationsToInsert.push(newObs);
       imported++;
     }
 
@@ -188,9 +200,14 @@ export async function importFromJson(
       }
     }
 
-    await saveObservationsJson(projectDir, existingObs);
-    await saveIdCounter(projectDir, nextId);
-    await saveSessionsJson(projectDir, existingSessions);
+    await Promise.all(observationsToInsert.map((observation) => tx.insert(observation)));
+    await tx.saveIdCounter(nextId);
+    // Persist imported sessions via store
+    for (const session of data.sessions) {
+      if (!existingSessionIds.has(session.id)) {
+        await sessionStore.insert(session);
+      }
+    }
   });
 
   return { observationsImported: imported, sessionsImported, skipped };

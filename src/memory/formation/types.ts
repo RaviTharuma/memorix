@@ -101,6 +101,21 @@ export interface EvaluateResult {
   reason: string;
 }
 
+/** Named Formation pipeline stage. */
+export type FormationStage = 'extract' | 'resolve' | 'evaluate';
+
+/** Per-stage diagnostics emitted during pipeline execution. */
+export interface FormationStageEvent {
+  /** Stage that emitted the event */
+  stage: FormationStage;
+  /** Lifecycle status for the stage */
+  status: 'start' | 'success' | 'skipped';
+  /** Duration of the stage when available */
+  stageDurationMs?: number;
+  /** Total elapsed time for the pipeline at emission time */
+  totalElapsedMs: number;
+}
+
 // ============================================================
 // Pipeline Output: FormedMemory
 // ============================================================
@@ -129,6 +144,8 @@ export interface FormedMemory {
     stagesCompleted: number;
     /** Whether this was run in shadow mode (no side effects) */
     shadow: boolean;
+    /** Per-stage durations in ms for diagnostics */
+    stageDurationsMs: Partial<Record<FormationStage, number>>;
   };
 
   // ── Governance fields (enterprise-grade metadata) ──
@@ -184,16 +201,20 @@ export interface FormationConfig {
   shadow?: boolean;
   /** Enable LLM-powered stages (requires LLM API key) */
   useLLM: boolean;
+  /** Abort in-flight LLM work when the formation budget expires. */
+  signal?: AbortSignal;
   /** Minimum value score to proceed with storage (default: 0.3) */
   minValueScore: number;
   /** Sampling rate for hooks path (0-1). 0 = always shadow, 1 = always full resolve */
   hooksSamplingRate?: number;
   /** Function to search existing memories (injected dependency) */
-  searchMemories: (query: string, limit: number, projectId: string) => Promise<SearchHit[]>;
+  searchMemories: (query: string, limit: number, projectId: string, signal?: AbortSignal) => Promise<SearchHit[]>;
   /** Function to get observation by ID (injected dependency) */
   getObservation: (id: number) => ExistingMemoryRef | null;
   /** Function to list existing entity names (injected dependency) */
   getEntityNames: () => string[];
+  /** Optional stage callback for diagnostics/logging */
+  onStageEvent?: (event: FormationStageEvent) => void;
 }
 
 /** A search hit from existing memories (used by Resolve stage) */

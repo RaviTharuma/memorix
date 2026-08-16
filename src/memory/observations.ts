@@ -8,27 +8,347 @@
  * and in the Orama search index (for full-text + vector search).
  */
 
-import type { Observation, ObservationType, ObservationStatus, MemorixDocument, ProgressInfo } from '../types.js';
+import type {
+  Observation,
+  ObservationAttachment,
+  ObservationAdmissionState,
+  ObservationReader,
+  ObservationVisibility,
+  ObservationType,
+  ObservationStatus,
+  MemorixDocument,
+  ProgressInfo,
+} from '../types.js';
 import { TOPIC_KEY_FAMILIES } from '../types.js';
-import { insertObservation, removeObservation, resetDb, generateEmbedding, batchGenerateEmbeddings, isEmbeddingEnabled } from '../store/orama-store.js';
-import { saveObservationsJson, loadObservationsJson, saveIdCounter, loadIdCounter } from '../store/persistence.js';
-import { withFileLock } from '../store/file-lock.js';
+import {
+  insertObservation,
+  removeObservation,
+  resetDb,
+  generateEmbedding,
+  batchGenerateEmbeddings,
+  getDb,
+  getDeferredCachedVectorHydration,
+  getVectorDimensions,
+  hydrateIndexForStartup,
+  hasObservationVector,
+  isEmbeddingEnabled,
+  makeOramaObservationId,
+  getLastSearchMode,
+  searchObservations,
+  updateObservationMetadata,
+} from '../store/orama-store.js';
+import { getObservationStore, initObservationStore } from '../store/obs-store.js';
 import { countTextTokens } from '../compact/token-budget.js';
 import { extractEntities, enrichConcepts } from './entity-extractor.js';
+import { getEmbeddingProvider, isEmbeddingExplicitlyDisabled, validateEmbeddingInput } from '../embedding/provider.js';
+import { sanitizeCredentials } from './secret-filter.js';
+import { enqueueClaimDerivation, enqueueObservationQualification } from '../runtime/lifecycle.js';
+import { canManageObservation, resolveObservationVisibility } from './visibility.js';
 
 /** In-memory observation list (loaded from persistence on init) */
 let observations: Observation[] = [];
 let nextId = 1;
 let projectDir: string | null = null;
+let searchIndexPrepared = false;
+export type ObservationEmbeddingWriteMode = 'background' | 'deferred';
+
+export interface ObservationRuntimeOptions {
+  /** Defer remote/local embedding to a detached worker for short-lived CLI writes. */
+  embeddingWriteMode?: ObservationEmbeddingWriteMode;
+  /** Git root used by the detached vector worker. */
+  projectRoot?: string;
+}
+
+let embeddingWriteMode: ObservationEmbeddingWriteMode = 'background';
+let embeddingWorkerProjectRoot: string | undefined;
+
+// ── Vector-missing tracking ──────────────────────────────────────
+// Tracks observation IDs whose async embedding write failed or was skipped.
+// Enables observability ("how many memories lack vectors?") and backfill.
+const vectorMissingIds = new Set<number>();
+let vectorBackfillRunning = false;
+let vectorSchemaUpgradePromise: Promise<boolean> | null = null;
+let lastVectorBackfill: {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  lastError?: string;
+  finishedAt: string;
+} | null = null;
+const embeddingFailureLogTimestamps = new Map<string, number>();
+const EMBEDDING_FAILURE_LOG_COOLDOWN_MS = 30_000;
+
+function logEmbeddingFailureOnce(key: string, message: string): void {
+  const now = Date.now();
+  const last = embeddingFailureLogTimestamps.get(key) ?? 0;
+  if (now - last < EMBEDDING_FAILURE_LOG_COOLDOWN_MS) return;
+  embeddingFailureLogTimestamps.set(key, now);
+  console.error(message);
+}
+
+function normalizeEmbeddingFailure(error: unknown): { key: string; message: string } {
+  const raw = error instanceof Error ? error.message : String(error);
+
+  if (
+    /embedding api error \(401\)/i.test(raw) ||
+    /invalid_api_key/i.test(raw) ||
+    /incorrect api key/i.test(raw) ||
+    /unauthorized/i.test(raw)
+  ) {
+    return {
+      key: 'embedding-auth',
+      message: 'Embedding API returned an invalid API key response; using BM25 until embedding recovers',
+    };
+  }
+
+  if (/embedding api timeout/i.test(raw)) {
+    return {
+      key: 'embedding-timeout',
+      message: 'Embedding API timed out; using BM25 until embedding recovers',
+    };
+  }
+
+  return {
+    key: raw,
+    message: raw,
+  };
+}
+
+function vectorBackfillError(error: unknown): string {
+  return sanitizeCredentials(normalizeEmbeddingFailure(error).message).slice(0, 1_000);
+}
+
+function queueVectorBackfill(
+  projectId: string,
+  options: { detachedWorker?: boolean; projectRoot?: string } = {},
+): void {
+  const dataDir = projectDir;
+  if (!dataDir) return;
+  void import('../runtime/maintenance-jobs.js')
+    .then(({ MaintenanceJobStore }) => {
+      new MaintenanceJobStore(dataDir).enqueue({
+        projectId,
+        kind: 'vector-backfill',
+        dedupeKey: 'vector-backfill',
+        payload: { limit: 12 },
+      });
+      if (options.detachedWorker && options.projectRoot) {
+        void import('../runtime/vector-backfill-runner.js')
+          .then(({ launchDetachedVectorBackfill }) => {
+            launchDetachedVectorBackfill({
+              projectId,
+              projectRoot: options.projectRoot!,
+              dataDir,
+            });
+          })
+          .catch(() => {
+            // The durable queue remains available to a later MCP session.
+          });
+      }
+    })
+    .catch(() => {
+      // Memory writes remain durable even when the optional maintenance queue is unavailable.
+    });
+}
+
+async function bindObservationCodeRefsBestEffort(observation: Observation): Promise<void> {
+  if (!projectDir) return;
+  try {
+    const { CodeGraphStore } = await import('../codegraph/store.js');
+    const { bindObservationToCode } = await import('../codegraph/binder.js');
+    const codeStore = new CodeGraphStore();
+    await codeStore.init(projectDir);
+    await bindObservationToCode(codeStore, observation);
+  } catch {
+    // Code refs enrich memory retrieval, but memory writes must remain durable without them.
+  }
+}
+
+function queueClaimDerivation(observation: Observation): void {
+  const dataDir = projectDir;
+  const isExplicit = observation.sourceDetail === 'explicit';
+  const isGit = observation.source === 'git' || observation.sourceDetail === 'git-ingest';
+  if (!dataDir || (!isExplicit && !isGit)) return;
+  try {
+    enqueueClaimDerivation({
+      dataDir,
+      projectId: observation.projectId,
+      observationId: observation.id,
+    });
+  } catch {
+    // The observation remains durable; a later scan can recover its claim.
+  }
+}
+
+function queueObservationQualification(observation: Observation): void {
+  const dataDir = projectDir;
+  if (!dataDir || observation.admissionState !== 'candidate') return;
+  try {
+    enqueueObservationQualification({
+      dataDir,
+      projectId: observation.projectId,
+      source: 'automatic-capture:' + observation.id,
+    });
+  } catch {
+    // Candidate evidence remains available for a later qualification scan.
+  }
+}
+
+function isVectorCompatibleWithCurrentIndex(embedding: number[] | null): boolean {
+  if (!embedding) return false;
+  const vectorDimensions = getVectorDimensions();
+  return vectorDimensions !== null &&
+    embedding.length === vectorDimensions &&
+    embedding.every(Number.isFinite);
+}
+
+/**
+ * A cache-less API startup deliberately creates a lexical index so MCP can
+ * answer immediately. Once the background lane obtains its first vector, the
+ * in-memory index must be rebuilt with a vector field in this same process.
+ */
+async function upgradeVectorSchemaAfterFirstEmbedding(embedding: number[]): Promise<boolean> {
+  if (isVectorCompatibleWithCurrentIndex(embedding)) return true;
+  if (getVectorDimensions() !== null || !embedding.every(Number.isFinite)) return false;
+
+  const targetProjectDir = projectDir;
+  if (!vectorSchemaUpgradePromise) {
+    vectorSchemaUpgradePromise = reindexObservations()
+      .then(() => projectDir === targetProjectDir && isVectorCompatibleWithCurrentIndex(embedding))
+      .catch(() => false)
+      .finally(() => {
+        vectorSchemaUpgradePromise = null;
+      });
+  }
+  return vectorSchemaUpgradePromise;
+}
 
 /**
  * Initialize the observations manager with a project directory.
+ * Auto-initializes the ObservationStore if not already set.
  */
-export async function initObservations(dir: string): Promise<void> {
+export async function initObservations(
+  dir: string,
+  options: ObservationRuntimeOptions = {},
+): Promise<void> {
+  embeddingWriteMode = options.embeddingWriteMode ?? 'background';
+  embeddingWorkerProjectRoot = options.projectRoot;
+  if (projectDir === dir) return;
+  await initObservationStore(dir);
+  const store = getObservationStore();
+  observations = await store.loadAll();
+  nextId = await store.loadIdCounter();
   projectDir = dir;
-  const loaded = await loadObservationsJson(dir);
-  observations = loaded as Observation[];
-  nextId = await loadIdCounter(dir);
+  searchIndexPrepared = false;
+  vectorSchemaUpgradePromise = null;
+}
+
+function scheduleObservationEmbedding(input: {
+  observationId: number;
+  projectId: string;
+  searchableText: string;
+  doc: MemorixDocument;
+}): void {
+  const { observationId, projectId, searchableText, doc } = input;
+  vectorMissingIds.add(observationId);
+
+  // A network fetch keeps Node's event loop alive even when its Promise is not
+  // awaited. One-shot CLI commands therefore persist first and let a detached
+  // worker consume the same durable queue.
+  if (embeddingWriteMode === 'deferred') {
+    if (isEmbeddingExplicitlyDisabled()) {
+      vectorMissingIds.delete(observationId);
+      return;
+    }
+    queueVectorBackfill(projectId, {
+      detachedWorker: true,
+      projectRoot: embeddingWorkerProjectRoot,
+    });
+    return;
+  }
+
+  void generateEmbedding(searchableText).then(async (embedding) => {
+    if (embedding) {
+      if (!isVectorCompatibleWithCurrentIndex(embedding)) {
+        await upgradeVectorSchemaAfterFirstEmbedding(embedding);
+      }
+      if (!isVectorCompatibleWithCurrentIndex(embedding)) {
+        const vectorDimensions = getVectorDimensions();
+        console.error(
+          `[memorix] Embedding dimension mismatch for obs-${observationId}: provider returned ${embedding.length}d, index expects ${vectorDimensions ?? 'unknown'}d (kept in backfill queue)`,
+        );
+        queueVectorBackfill(projectId);
+        return;
+      }
+      try {
+        await removeObservation(makeOramaObservationId(projectId, observationId));
+        await insertObservation(Object.assign({}, doc, { embedding }));
+        vectorMissingIds.delete(observationId);
+      } catch {
+        console.error(`[memorix] Embedding index update failed for obs-${observationId} (kept in backfill queue)`);
+        queueVectorBackfill(projectId);
+      }
+    } else if (isEmbeddingExplicitlyDisabled()) {
+      vectorMissingIds.delete(observationId);
+    } else {
+      queueVectorBackfill(projectId);
+      logEmbeddingFailureOnce(
+        'provider-unavailable',
+        `[memorix] Embedding provider unavailable (using BM25 until embedding recovers; queued obs-${observationId} for retry)`,
+      );
+    }
+  }).catch((err) => {
+    queueVectorBackfill(projectId);
+    const failure = normalizeEmbeddingFailure(err);
+    logEmbeddingFailureOnce(
+      failure.key,
+      `[memorix] Async embedding failed (using BM25 until embedding recovers; queued obs-${observationId} for retry): ${failure.message}`,
+    );
+  });
+}
+
+/**
+ * Check cross-process freshness and reload if another process has written.
+ *
+ * Call this at every read boundary (MCP tool handler, dashboard API, etc.)
+ * BEFORE reading observations[] via getObservation / getAllObservations /
+ * getProjectObservations / getObservationCount.
+ *
+ * When the SQLite storage_generation has advanced beyond our local snapshot:
+ *   1. Reloads observations[] from the store
+ *   2. Updates nextId from the store
+ *   3. Rebuilds the Orama search index (so vector + BM25 search stay in sync)
+ *
+ * For DegradedBackend this is a no-op (always returns false).
+ */
+export async function ensureFreshObservations(): Promise<boolean> {
+  if (!projectDir) return false;
+  try {
+    const store = getObservationStore();
+    const wasStale = await store.ensureFresh();
+    if (wasStale) {
+      observations = await store.loadAll();
+      nextId = await store.loadIdCounter();
+      await reindexObservations();
+      searchIndexPrepared = true;
+      return true;
+    }
+  } catch {
+    // Best-effort — don't crash the read path on freshness failure
+  }
+  return false;
+}
+
+/**
+ * @internal Observation-only freshness gate.
+ *
+ * Public callers should use `withFreshIndex()` from freshness.ts instead,
+ * which also covers mini-skills. This function remains for internal use
+ * by the freshness module and legacy test code only.
+ */
+export async function withFreshObservations<T>(fn: () => T | Promise<T>): Promise<T> {
+  await ensureFreshObservations();
+  return fn();
 }
 
 /**
@@ -41,6 +361,15 @@ export async function initObservations(dir: string): Promise<void> {
  *   3. Inserts into Orama for full-text search
  *   4. Persists to disk
  */
+function formatAttachmentProvenance(attachments?: ObservationAttachment[]): string {
+  return (attachments ?? []).map((attachment) => [
+    attachment.name,
+    attachment.modality,
+    attachment.mimeType,
+    attachment.url,
+  ].filter(Boolean).join(' ')).join('\n');
+}
+
 export async function storeObservation(input: {
   entityName: string;
   type: ObservationType;
@@ -57,29 +386,67 @@ export async function storeObservation(input: {
   commitHash?: string;
   relatedCommits?: string[];
   relatedEntities?: string[];
+  /** Safe HTTPS media references only; inline media is rejected. */
+  attachments?: ObservationAttachment[];
+  sourceDetail?: 'explicit' | 'hook' | 'git-ingest';
+  valueCategory?: 'core' | 'contextual' | 'ephemeral';
+  admissionState?: ObservationAdmissionState;
+  admissionReason?: string;
+  visibility?: ObservationVisibility;
+  sharedWithAgentIds?: string[];
+  createdByAgentId?: string;
+  /** Optional caller-bound write scope for topic-key upserts. */
+  visibilityReader?: ObservationReader;
+  /**
+   * Internal transaction callback for a second SQLite record that must either
+   * commit with this observation or not exist at all. It is intentionally not
+   * exposed through the SDK input surface.
+   */
+  onPersisted?: (observation: Observation) => void | Promise<void>;
 }): Promise<{ observation: Observation; upserted: boolean }> {
   const now = new Date().toISOString();
 
-  // Topic key upsert: check if an observation with the same topicKey+projectId exists
+  // ── Central secret sanitization — strip credential values before any persistence ──
+  // Covers all write paths: hooks, git-ingest, CLI, reasoning, compact-on-write, etc.
+  input = { ...input, title: sanitizeCredentials(input.title), narrative: sanitizeCredentials(input.narrative), facts: input.facts?.map(sanitizeCredentials) };
+
+  const safeAttachments = input.attachments?.map((attachment) => {
+    validateEmbeddingInput({ modality: attachment.modality, url: attachment.url });
+    return {
+      modality: attachment.modality,
+      url: attachment.url,
+      ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+      ...(attachment.name ? { name: attachment.name } : {}),
+    } satisfies ObservationAttachment;
+  });
+  if (safeAttachments) input = { ...input, attachments: safeAttachments };
+
+
+  // Sync the local cache before using it as the topicKey fast path. This costs a
+  // generation read in the normal case and only reloads when another process wrote.
+  await ensureFreshObservations();
+
+  // Topic key upsert: fast-path check in-memory (optimistic, may be stale).
+  // A second authoritative check happens inside the file lock to prevent TOCTOU races
+  // where two concurrent calls with the same topicKey both miss this check.
   if (input.topicKey) {
     const existing = observations.find(
       o => o.topicKey === input.topicKey && o.projectId === input.projectId,
     );
     if (existing) {
-      return { observation: await upsertObservation(existing, input, now), upserted: true };
+      if (input.visibilityReader && !canManageObservation(existing, input.visibilityReader)) {
+        throw new Error('Cannot update a memory outside this session\'s write scope.');
+      }
+      const observation = await upsertObservation(existing, input, now);
+      await input.onPersisted?.(observation);
+      return { observation, upserted: true };
     }
   }
 
-  const id = nextId++;
-
-  // Auto-extract entities from narrative (inspired by MemCP RegexEntityExtractor)
+  // ── Pre-compute enrichments (pure, no side-effects) ──
   const contentForExtraction = [input.title, input.narrative, ...(input.facts ?? [])].join(' ');
   const extracted = extractEntities(contentForExtraction);
-
-  // Auto-enrich concepts with extracted entities
   const enrichedConcepts = enrichConcepts(input.concepts ?? [], extracted);
-
-  // Auto-enrich filesModified with extracted file paths
   const userFiles = new Set((input.filesModified ?? []).map((f) => f.toLowerCase()));
   const enrichedFiles = [...(input.filesModified ?? [])];
   for (const f of extracted.files) {
@@ -87,104 +454,206 @@ export async function storeObservation(input: {
       enrichedFiles.push(f);
     }
   }
-
-  // Count tokens for the full observation content
   const fullText = [
-    input.title,
-    input.narrative,
-    ...(input.facts ?? []),
-    ...enrichedFiles,
-    ...enrichedConcepts,
+    input.title, input.narrative,
+    ...(input.facts ?? []), ...enrichedFiles, ...enrichedConcepts,
   ].join(' ');
   const tokens = countTextTokens(fullText);
 
-  const observation: Observation = {
-    id,
-    entityName: input.entityName,
-    type: input.type,
-    title: input.title,
-    narrative: input.narrative,
-    facts: input.facts ?? [],
-    filesModified: enrichedFiles,
-    concepts: enrichedConcepts,
-    tokens,
-    createdAt: now,
-    projectId: input.projectId,
-    hasCausalLanguage: extracted.hasCausalLanguage,
-    topicKey: input.topicKey,
-    revisionCount: 1,
-    sessionId: input.sessionId,
-    status: 'active',
-    progress: input.progress,
-    source: input.source,
-    commitHash: input.commitHash,
-    relatedCommits: input.relatedCommits,
-    relatedEntities: input.relatedEntities,
-  };
+  // ── Atomic write: ID allocation + persist + in-memory push inside lock ──
+  // This prevents concurrent calls from getting duplicate IDs or silently
+  // losing observations due to stale in-memory state.
+  let observation!: Observation;
+  let doc!: MemorixDocument;
 
-  observations.push(observation);
+  let upsertedInsideLock = false;
+  let reloadCacheAfterCommit = false;
+  let persistedCallbackInvoked = false;
+  const assignAndPersist = async () => {
+    if (projectDir) {
+      const store = getObservationStore();
+      const cachedGeneration = store.getGeneration();
+      await store.atomic(async (tx) => {
+        const transactionGeneration = await tx.getGeneration();
+        const diskNextId = await tx.loadIdCounter();
 
-  // Insert into Orama search index WITHOUT embedding first (non-blocking)
-  const doc: MemorixDocument = {
-    id: `obs-${id}`,
-    observationId: id,
-    entityName: input.entityName,
-    type: input.type,
-    title: input.title,
-    narrative: input.narrative,
-    facts: (input.facts ?? []).join('\n'),
-    filesModified: enrichedFiles.join('\n'),
-    concepts: enrichedConcepts.map(c => c.replace(/-/g, ' ')).join(', '),
-    tokens,
-    createdAt: now,
-    projectId: input.projectId,
-    accessCount: 0,
-    lastAccessedAt: '',
-    status: 'active',
-    source: input.source ?? 'agent',
-  };
+        // A different writer committed after the cache freshness check but before
+        // this transaction acquired its lock. Keep the cache coherent after commit.
+        reloadCacheAfterCommit = transactionGeneration !== cachedGeneration;
 
-  await insertObservation(doc);
+        // ── Atomic topicKey re-check inside lock (prevents TOCTOU race) ──
+        // Two concurrent calls with the same topicKey may both pass the fast-path
+        // check above, but here we re-check against the authoritative disk state.
+        if (input.topicKey) {
+          const diskExisting = await tx.findByTopicKey(input.projectId, input.topicKey);
+          if (diskExisting) {
+            if (input.visibilityReader && !canManageObservation(diskExisting, input.visibilityReader)) {
+              throw new Error('Cannot update a memory outside this session\'s write scope.');
+            }
+            // Switch to upsert path — update the existing observation after this
+            // short transaction has released its lock.
+            upsertedInsideLock = true;
+            observation = diskExisting;
+            return; // Exit atomic — upsert will be handled after assignAndPersist
+          }
+        }
 
-  // Persist to disk with file lock (cross-process safe)
-  if (projectDir) {
-    await withFileLock(projectDir, async () => {
-      // Re-read from disk to merge changes from other processes
-      const diskObs = await loadObservationsJson(projectDir!) as Observation[];
-      const diskNextId = await loadIdCounter(projectDir!);
+        // Use the higher of in-memory vs disk counter (handles multi-process)
+        const id = Math.max(nextId, diskNextId);
 
-      // Merge: add our new observation if not already present
-      const existingIds = new Set(diskObs.map(o => o.id));
-      if (!existingIds.has(observation.id)) {
-        diskObs.push(observation);
+        observation = {
+          id,
+          entityName: input.entityName,
+          type: input.type,
+          title: input.title,
+          narrative: input.narrative,
+          facts: input.facts ?? [],
+          filesModified: enrichedFiles,
+          concepts: enrichedConcepts,
+          tokens,
+          createdAt: now,
+          projectId: input.projectId,
+          hasCausalLanguage: extracted.hasCausalLanguage,
+          topicKey: input.topicKey,
+          revisionCount: 1,
+          sessionId: input.sessionId,
+          status: 'active',
+          progress: input.progress,
+          source: input.source,
+          commitHash: input.commitHash,
+          relatedCommits: input.relatedCommits,
+          relatedEntities: input.relatedEntities,
+          attachments: input.attachments,
+          sourceDetail: input.sourceDetail,
+          valueCategory: input.valueCategory,
+          admissionState: input.admissionState,
+          admissionReason: input.admissionReason ? sanitizeCredentials(input.admissionReason) : undefined,
+          visibility: input.visibility ?? 'project',
+          sharedWithAgentIds: input.sharedWithAgentIds,
+          createdByAgentId: input.createdByAgentId,
+          // Predict the generation that atomic() will commit after this callback.
+          // bumpGeneration() runs after fn(tx) returns, incrementing by 1.
+          writeGeneration: transactionGeneration + 1,
+        };
+
+        await tx.insert(observation);
+        await input.onPersisted?.(observation);
+        persistedCallbackInvoked = true;
+        await tx.saveIdCounter(id + 1);
+      });
+
+      // Phase 4a: confirm writeGeneration matches actual post-bump value
+      observation.writeGeneration = store.getGeneration();
+
+      if (upsertedInsideLock || reloadCacheAfterCommit) {
+        observations = await store.loadAll();
+        nextId = await store.loadIdCounter();
+        if (upsertedInsideLock) {
+          observation = observations.find((candidate) => candidate.id === observation.id)
+            ?? observation;
+        }
+      } else {
+        observations.push(observation);
+        nextId = observation.id + 1;
       }
 
-      // Use the higher nextId (ours or disk's)
-      const mergedNextId = Math.max(nextId, diskNextId);
+      // If the atomic block detected a topicKey duplicate, skip Orama insert — upsert handles it
+      if (upsertedInsideLock) return;
+    } else {
+      // No projectDir (e.g., tests) — just use in-memory counter
+      const id = nextId++;
+      observation = {
+        id,
+        entityName: input.entityName,
+        type: input.type,
+        title: input.title,
+        narrative: input.narrative,
+        facts: input.facts ?? [],
+        filesModified: enrichedFiles,
+        concepts: enrichedConcepts,
+        tokens,
+        createdAt: now,
+        projectId: input.projectId,
+        hasCausalLanguage: extracted.hasCausalLanguage,
+        topicKey: input.topicKey,
+        revisionCount: 1,
+        sessionId: input.sessionId,
+        status: 'active',
+        progress: input.progress,
+        source: input.source,
+        commitHash: input.commitHash,
+        relatedCommits: input.relatedCommits,
+        relatedEntities: input.relatedEntities,
+      attachments: input.attachments,
+        sourceDetail: input.sourceDetail,
+        valueCategory: input.valueCategory,
+        admissionState: input.admissionState,
+        admissionReason: input.admissionReason ? sanitizeCredentials(input.admissionReason) : undefined,
+        visibility: input.visibility ?? 'project',
+        sharedWithAgentIds: input.sharedWithAgentIds,
+        createdByAgentId: input.createdByAgentId,
+        writeGeneration: 0,
+      };
+      observations.push(observation);
+      await input.onPersisted?.(observation);
+      persistedCallbackInvoked = true;
+    }
 
-      // Update in-memory state with merged data
-      observations = diskObs;
-      nextId = mergedNextId;
+    // Build Orama doc AFTER id is assigned
+    doc = {
+      id: makeOramaObservationId(input.projectId, observation.id),
+      observationId: observation.id,
+      entityName: input.entityName,
+      type: input.type,
+      title: input.title,
+      narrative: input.narrative,
+      facts: (input.facts ?? []).join('\n'),
+      filesModified: enrichedFiles.join('\n'),
+      concepts: enrichedConcepts.map(c => c.replace(/-/g, ' ')).join(', '),
+      attachments: formatAttachmentProvenance(input.attachments),
+      tokens,
+      createdAt: now,
+      projectId: input.projectId,
+      accessCount: 0,
+      lastAccessedAt: '',
+      status: 'active',
+      source: input.source ?? 'agent',
+      sourceDetail: input.sourceDetail ?? '',
+      valueCategory: input.valueCategory ?? '',
+      admissionState: input.admissionState ?? '',
+      admissionReason: input.admissionReason ? sanitizeCredentials(input.admissionReason) : '',
+      visibility: input.visibility ?? 'project',
+      createdByAgentId: input.createdByAgentId ?? '',
+      sharedWithAgentIds: JSON.stringify(input.sharedWithAgentIds ?? []),
+    };
 
-      await saveObservationsJson(projectDir!, observations);
-      await saveIdCounter(projectDir!, nextId);
-    });
+    await insertObservation(doc);
+  };
+
+  await assignAndPersist();
+
+  // If the lock discovered a topicKey duplicate on disk, delegate to upsert
+  if (upsertedInsideLock) {
+    const updated = await upsertObservation(observation, input, now);
+    await input.onPersisted?.(updated);
+    return { observation: updated, upserted: true };
   }
 
-  // Generate embedding async (fire-and-forget) — never blocks MCP response
-  const searchableText = [input.title, input.narrative, ...(input.facts ?? [])].join(' ');
-  generateEmbedding(searchableText).then(async (embedding) => {
-    if (embedding) {
-      try {
-        const { removeObservation: removeObs } = await import('../store/orama-store.js');
-        await removeObs(`obs-${id}`);
-        await insertObservation(Object.assign({}, doc, { embedding }));
-      } catch {
-        // Embedding index update failed — observation still persisted without vector
-      }
-    }
-  }).catch((err) => {
-    console.error(`[memorix] Async embedding failed for obs-${id}: ${err instanceof Error ? err.message : err}`);
+  // The normal persistent path invokes the callback inside the SQLite
+  // transaction. Keep the in-memory fallback defensively covered too.
+  if (!persistedCallbackInvoked) await input.onPersisted?.(observation);
+
+  await bindObservationCodeRefsBestEffort(observation);
+  queueObservationQualification(observation);
+  if (resolveObservationVisibility(observation) === 'project') {
+    queueClaimDerivation(observation);
+  }
+
+  scheduleObservationEmbedding({
+    observationId: observation.id,
+    projectId: input.projectId,
+    searchableText: [input.title, input.narrative, ...(input.facts ?? [])].join(' '),
+    doc,
   });
 
   return { observation, upserted: false };
@@ -208,9 +677,19 @@ async function upsertObservation(
     topicKey?: string;
     sessionId?: string;
     progress?: ProgressInfo;
+    attachments?: ObservationAttachment[];
+    sourceDetail?: 'explicit' | 'hook' | 'git-ingest';
+    valueCategory?: 'core' | 'contextual' | 'ephemeral';
+    admissionState?: ObservationAdmissionState;
+    admissionReason?: string;
+    visibility?: ObservationVisibility;
+    sharedWithAgentIds?: string[];
   },
   now: string,
 ): Promise<Observation> {
+  // ── Central secret sanitization ──
+  input = { ...input, title: sanitizeCredentials(input.title), narrative: sanitizeCredentials(input.narrative), facts: input.facts?.map(sanitizeCredentials) };
+
   // Auto-extract and enrich (same as storeObservation)
   const contentForExtraction = [input.title, input.narrative, ...(input.facts ?? [])].join(' ');
   const extracted = extractEntities(contentForExtraction);
@@ -232,6 +711,7 @@ async function upsertObservation(
   existing.title = input.title;
   existing.narrative = input.narrative;
   existing.facts = input.facts ?? [];
+  existing.attachments = input.attachments;
   existing.filesModified = enrichedFiles;
   existing.concepts = enrichedConcepts;
   existing.tokens = tokens;
@@ -241,10 +721,16 @@ async function upsertObservation(
   existing.status = 'active';
   if (input.sessionId) existing.sessionId = input.sessionId;
   if (input.progress) existing.progress = input.progress;
+  if (input.sourceDetail !== undefined) existing.sourceDetail = input.sourceDetail;
+  if (input.valueCategory !== undefined) existing.valueCategory = input.valueCategory;
+  if (input.admissionState !== undefined) existing.admissionState = input.admissionState;
+  if (input.admissionReason !== undefined) existing.admissionReason = sanitizeCredentials(input.admissionReason);
+  if (input.visibility !== undefined) existing.visibility = input.visibility;
+  if (input.sharedWithAgentIds !== undefined) existing.sharedWithAgentIds = input.sharedWithAgentIds;
 
   // Re-index in Orama WITHOUT embedding first (non-blocking)
   const doc: MemorixDocument = {
-    id: `obs-${existing.id}`,
+    id: makeOramaObservationId(existing.projectId, existing.id),
     observationId: existing.id,
     entityName: existing.entityName,
     type: existing.type,
@@ -253,6 +739,7 @@ async function upsertObservation(
     facts: existing.facts.join('\n'),
     filesModified: enrichedFiles.join('\n'),
     concepts: enrichedConcepts.map(c => c.replace(/-/g, ' ')).join(', '),
+    attachments: formatAttachmentProvenance(existing.attachments),
     tokens,
     createdAt: existing.createdAt,
     projectId: existing.projectId,
@@ -260,45 +747,49 @@ async function upsertObservation(
     lastAccessedAt: '',
     status: 'active',
     source: existing.source ?? 'agent',
+    sourceDetail: existing.sourceDetail ?? '',
+    valueCategory: existing.valueCategory ?? '',
+    admissionState: existing.admissionState ?? '',
+    admissionReason: existing.admissionReason ?? '',
+    visibility: existing.visibility ?? 'project',
+    createdByAgentId: existing.createdByAgentId ?? '',
+    sharedWithAgentIds: JSON.stringify(existing.sharedWithAgentIds ?? []),
   };
 
-  // Remove old doc and insert updated one
+  // Remove old doc and insert updated one (with retry for concurrent upsert race)
+  const oramaId = makeOramaObservationId(existing.projectId, existing.id);
   try {
     const { removeObservation } = await import('../store/orama-store.js');
-    await removeObservation(`obs-${existing.id}`);
+    await removeObservation(oramaId);
   } catch { /* may not exist in index */ }
-  await insertObservation(doc);
-
-  // Persist
-  if (projectDir) {
-    await withFileLock(projectDir, async () => {
-      const diskObs = await loadObservationsJson(projectDir!) as Observation[];
-      const idx = diskObs.findIndex(o => o.id === existing.id);
-      if (idx >= 0) {
-        diskObs[idx] = existing;
-      } else {
-        diskObs.push(existing);
-      }
-      observations = diskObs;
-      await saveObservationsJson(projectDir!, observations);
-    });
+  try {
+    await insertObservation(doc);
+  } catch {
+    // Concurrent upsert may have already re-inserted — retry remove+insert once
+    try {
+      const { removeObservation: removeObs } = await import('../store/orama-store.js');
+      await removeObs(oramaId);
+      await insertObservation(doc);
+    } catch { /* best effort — file persistence is the source of truth */ }
   }
 
-  // Generate embedding async (fire-and-forget) — never blocks MCP response
-  const searchableText = [input.title, input.narrative, ...(input.facts ?? [])].join(' ');
-  const obsId = existing.id;
-  generateEmbedding(searchableText).then(async (embedding) => {
-    if (embedding) {
-      try {
-        const { removeObservation: removeObs } = await import('../store/orama-store.js');
-        await removeObs(`obs-${obsId}`);
-        await insertObservation(Object.assign({}, doc, { embedding }));
-      } catch {
-        // Embedding index update failed — observation still persisted without vector
-      }
-    }
-  }).catch((err) => {
-    console.error(`[memorix] Async embedding failed for obs-${obsId}: ${err instanceof Error ? err.message : err}`);
+  // Persist via ObservationStore
+  if (projectDir) {
+    const store = getObservationStore();
+    await store.update(existing);
+  }
+
+  await bindObservationCodeRefsBestEffort(existing);
+  queueObservationQualification(existing);
+  if (resolveObservationVisibility(existing) === 'project') {
+    queueClaimDerivation(existing);
+  }
+
+  scheduleObservationEmbedding({
+    observationId: existing.id,
+    projectId: existing.projectId,
+    searchableText: [input.title, input.narrative, ...(input.facts ?? [])].join(' '),
+    doc,
   });
 
   return existing;
@@ -307,8 +798,81 @@ async function upsertObservation(
 /**
  * Get an observation by ID.
  */
-export function getObservation(id: number): Observation | undefined {
-  return observations.find((o) => o.id === id);
+export function getObservation(id: number, projectId?: string): Observation | undefined {
+  return observations.find((o) => o.id === id && (projectId ? o.projectId === projectId : true));
+}
+
+/**
+ * Promote or demote an automatic observation without changing its content.
+ * The expected-state guard keeps concurrent maintenance workers from
+ * resurrecting an observation that another writer has already changed.
+ */
+export async function updateObservationAdmission(input: {
+  observationId: number;
+  projectId?: string;
+  expectedState?: ObservationAdmissionState;
+  admissionState: ObservationAdmissionState;
+  admissionReason: string;
+  visibility?: ObservationVisibility;
+}): Promise<Observation | undefined> {
+  await ensureFreshObservations();
+  const cached = observations.find((observation) =>
+    observation.id === input.observationId &&
+    (!input.projectId || observation.projectId === input.projectId),
+  );
+  if (!cached) return undefined;
+
+  const now = new Date().toISOString();
+  const admissionReason = sanitizeCredentials(input.admissionReason).slice(0, 240);
+  const apply = (current: Observation): Observation | undefined => {
+    if (input.projectId && current.projectId !== input.projectId) return undefined;
+    if (input.expectedState && current.admissionState !== input.expectedState) return undefined;
+    return {
+      ...current,
+      admissionState: input.admissionState,
+      admissionReason,
+      ...(input.visibility !== undefined ? { visibility: input.visibility } : {}),
+      updatedAt: now,
+    };
+  };
+
+  let updated: Observation | undefined;
+  if (projectDir) {
+    const store = getObservationStore();
+    await store.atomic(async (tx) => {
+      const current = await tx.getById(input.observationId);
+      if (!current) return;
+      const next = apply(current);
+      if (!next) return;
+      await tx.update(next);
+      updated = next;
+    });
+  } else {
+    updated = apply(cached);
+  }
+
+  if (!updated) return undefined;
+  observations = observations.map((observation) =>
+    observation.id === updated!.id && observation.projectId === updated!.projectId
+      ? updated!
+      : observation,
+  );
+
+  try {
+    await updateObservationMetadata(updated.projectId, updated.id, {
+      admissionState: updated.admissionState,
+      admissionReason: updated.admissionReason,
+      ...(updated.visibility !== undefined ? { visibility: updated.visibility } : {}),
+    });
+  } catch {
+    // SQLite is canonical. The next index hydration repairs a missed update.
+  }
+
+  if (updated.admissionState === 'qualified' && resolveObservationVisibility(updated) === 'project') {
+    queueClaimDerivation(updated);
+  }
+
+  return updated;
 }
 
 /**
@@ -321,6 +885,7 @@ export async function resolveObservations(
 ): Promise<{ resolved: number[]; notFound: number[] }> {
   const resolved: number[] = [];
   const notFound: number[] = [];
+  const changed: Observation[] = [];
   const now = new Date().toISOString();
 
   for (const id of ids) {
@@ -335,13 +900,14 @@ export async function resolveObservations(
       obs.progress.status = status === 'resolved' ? 'completed' : obs.progress.status;
     }
     resolved.push(id);
+    changed.push(obs);
 
     // Update Orama index (without blocking on embedding)
     try {
       const { removeObservation: removeObs } = await import('../store/orama-store.js');
-      await removeObs(`obs-${id}`);
+      await removeObs(makeOramaObservationId(obs.projectId, id));
       const doc: MemorixDocument = {
-        id: `obs-${obs.id}`,
+        id: makeOramaObservationId(obs.projectId, obs.id),
         observationId: obs.id,
         entityName: obs.entityName,
         type: obs.type,
@@ -350,6 +916,7 @@ export async function resolveObservations(
         facts: obs.facts.join('\n'),
         filesModified: obs.filesModified.join('\n'),
         concepts: obs.concepts.map(c => c.replace(/-/g, ' ')).join(', '),
+        attachments: formatAttachmentProvenance(obs.attachments),
         tokens: obs.tokens,
         createdAt: obs.createdAt,
         projectId: obs.projectId,
@@ -357,6 +924,13 @@ export async function resolveObservations(
         lastAccessedAt: '',
         status,
         source: obs.source ?? 'agent',
+        sourceDetail: obs.sourceDetail ?? '',
+        valueCategory: obs.valueCategory ?? '',
+        admissionState: obs.admissionState ?? '',
+        admissionReason: obs.admissionReason ?? '',
+        visibility: obs.visibility ?? 'project',
+        createdByAgentId: obs.createdByAgentId ?? '',
+        sharedWithAgentIds: JSON.stringify(obs.sharedWithAgentIds ?? []),
       };
       await insertObservation(doc);
       // Async embedding update (fire-and-forget)
@@ -372,10 +946,11 @@ export async function resolveObservations(
     } catch { /* best effort */ }
   }
 
-  // Persist
+  // Persist via ObservationStore
   if (projectDir && resolved.length > 0) {
-    await withFileLock(projectDir, async () => {
-      await saveObservationsJson(projectDir!, observations);
+    const store = getObservationStore();
+    await store.atomic(async (tx) => {
+      await Promise.all(changed.map((observation) => tx.update(observation)));
     });
   }
 
@@ -412,16 +987,19 @@ export async function migrateProjectIds(
   if (nonCanonical.size === 0) return 0;
 
   let migrated = 0;
+  const changed: Observation[] = [];
   for (const obs of observations) {
     if (nonCanonical.has(obs.projectId)) {
       obs.projectId = canonicalId;
       migrated++;
+      changed.push(obs);
     }
   }
 
   if (migrated > 0 && projectDir) {
-    await withFileLock(projectDir, async () => {
-      await saveObservationsJson(projectDir!, observations);
+    const store = getObservationStore();
+    await store.atomic(async (tx) => {
+      await Promise.all(changed.map((observation) => tx.update(observation)));
     });
   }
 
@@ -472,8 +1050,8 @@ export function suggestTopicKey(type: string, title: string): string {
 }
 
 /**
- * Reload observations into the Orama index.
- * Called during server startup to restore the search index.
+ * Reload observations into the Orama index with full corpus embeddings.
+ * Intended for explicit heavy rebuilds, not normal MCP startup.
  *
  * Optimization: uses batch embedding (ONNX processes 64 texts at a time)
  * instead of individual embed calls. This reduces startup CPU from minutes
@@ -484,17 +1062,43 @@ export async function reindexObservations(): Promise<number> {
 
   // Reset the Orama index to ensure clean reindex (idempotent)
   await resetDb();
+  searchIndexPrepared = false;
+  vectorMissingIds.clear();
 
-  // Batch-generate all embeddings at once (much faster than individual calls)
-  let embeddings: (number[] | null)[] = [];
-  if (isEmbeddingEnabled()) {
+  // Prefer already-persisted vectors for remote providers. This restores semantic
+  // recall after a restart without waiting on the network; cache misses remain
+  // in the existing bounded background recovery lane.
+  let embeddings: (number[] | null)[] = observations.map(() => null);
+  const provider = await getEmbeddingProvider();
+  const canBatchEmbedAtStartup = provider !== null && !provider.name.startsWith('api-');
+
+  // This is an explicit rebuild path. Establish the current Orama schema before
+  // accepting cached vectors so a stale cache entry cannot make an observation
+  // disappear from the lexical index on insert.
+  await getDb();
+
+  const texts = observations.map(obs =>
+    [obs.title, obs.narrative, ...obs.facts].join(' '),
+  );
+
+  if (provider?.getCachedEmbeddings) {
     try {
-      const texts = observations.map(obs =>
-        [obs.title, obs.narrative, ...obs.facts].join(' '),
-      );
-      embeddings = await batchGenerateEmbeddings(texts);
+      embeddings = await provider.getCachedEmbeddings(texts);
     } catch {
+      // Cache lookup is optional; remote cache misses continue to background recovery.
+    }
+  }
+
+  if (provider && !canBatchEmbedAtStartup) {
+    console.error('[memorix] Startup reindex: restored cached API embeddings; uncached vectors stay in background recovery');
+  }
+
+  if (canBatchEmbedAtStartup) {
+    try {
+      embeddings = await batchGenerateEmbeddings(texts);
       // Batch embedding failed — fall back to no embeddings
+    } catch {
+      // Batch embedding failed; fall back to no embeddings.
     }
   }
 
@@ -503,7 +1107,14 @@ export async function reindexObservations(): Promise<number> {
     const obs = observations[i];
     try {
       const embedding = embeddings[i] ?? null;
-      const docId = `obs-${obs.id}`;
+      const compatibleEmbedding = isVectorCompatibleWithCurrentIndex(embedding) ? embedding : null;
+      if (embedding && !compatibleEmbedding) {
+        const vectorDimensions = getVectorDimensions();
+        console.error(
+          `[memorix] Startup reindex embedding mismatch for obs-${obs.id}: provider returned ${embedding.length}d, index expects ${vectorDimensions ?? 'unknown'}d (queued for backfill)`,
+        );
+      }
+      const docId = makeOramaObservationId(obs.projectId, obs.id);
       const doc: MemorixDocument = {
         id: docId,
         observationId: obs.id,
@@ -514,6 +1125,7 @@ export async function reindexObservations(): Promise<number> {
         facts: obs.facts.join('\n'),
         filesModified: obs.filesModified.join('\n'),
         concepts: obs.concepts.map((c: string) => c.replace(/-/g, ' ')).join(', '),
+        attachments: formatAttachmentProvenance(obs.attachments),
         tokens: obs.tokens,
         createdAt: obs.createdAt,
         projectId: obs.projectId,
@@ -521,13 +1133,301 @@ export async function reindexObservations(): Promise<number> {
         lastAccessedAt: '',
         status: obs.status ?? 'active',
         source: obs.source ?? 'agent',
-        ...(embedding ? { embedding } : {}),
+        sourceDetail: obs.sourceDetail ?? '',
+        valueCategory: obs.valueCategory ?? '',
+        admissionState: obs.admissionState ?? '',
+        admissionReason: obs.admissionReason ?? '',
+        visibility: obs.visibility ?? 'project',
+        createdByAgentId: obs.createdByAgentId ?? '',
+        sharedWithAgentIds: JSON.stringify(obs.sharedWithAgentIds ?? []),
+        ...(compatibleEmbedding ? { embedding: compatibleEmbedding } : {}),
       };
       await insertObservation(doc);
+      if (!compatibleEmbedding && !isEmbeddingExplicitlyDisabled()) {
+        vectorMissingIds.add(obs.id);
+      }
       count++;
     } catch (err) {
       console.error(`[memorix] Failed to reindex observation #${obs.id}: ${err}`);
     }
   }
+  searchIndexPrepared = true;
   return count;
+}
+
+/**
+ * Prepare the search index for startup and hot-reload without blocking on
+ * corpus-wide embedding generation.
+ *
+ * This hydrates the lexical/BM25 index immediately so MCP availability is not
+ * coupled to embedding provider throughput. Missing vectors are queued for the
+ * existing background backfill cycle.
+ */
+export async function prepareSearchIndex(): Promise<number> {
+  if (searchIndexPrepared) return 0;
+
+  const count = await hydrateIndexForStartup(observations as unknown as any[]);
+  if (count === 0) {
+    searchIndexPrepared = true;
+    return 0;
+  }
+
+  const hydratedProjectDir = projectDir;
+  const queueMissingVectors = () => {
+    if (projectDir !== hydratedProjectDir) return;
+    vectorMissingIds.clear();
+    if (!isEmbeddingExplicitlyDisabled()) {
+      const projectsWithMissingVectors = new Set<string>();
+      for (const obs of observations) {
+        // Queue ALL statuses for vector backfill — status filtering happens at query time,
+        // not at index time. Omitting non-active observations here would permanently
+        // exclude resolved/archived memories from hybrid search after restart.
+        if (!hasObservationVector(obs.projectId, obs.id)) {
+          vectorMissingIds.add(obs.id);
+          projectsWithMissingVectors.add(obs.projectId);
+        }
+      }
+      for (const projectId of projectsWithMissingVectors) queueVectorBackfill(projectId);
+    }
+  };
+
+  const cacheHydration = getDeferredCachedVectorHydration();
+  if (cacheHydration) {
+    // Let the disk cache finish outside the interactive startup path. Misses are
+    // queued only after it has had a chance to restore compatible vectors.
+    void cacheHydration.finally(queueMissingVectors);
+  } else {
+    queueMissingVectors();
+  }
+
+  searchIndexPrepared = true;
+  return count;
+}
+
+// ── Vector-missing observability & backfill ─────────────────────────
+
+/**
+ * Get the current set of observation IDs that are missing vector embeddings.
+ * Useful for dashboards, health checks, and monitoring search quality degradation.
+ */
+export function getVectorMissingIds(projectId?: string): number[] {
+  if (!projectId) return [...vectorMissingIds];
+  const observationById = new Map(observations.map((observation) => [observation.id, observation]));
+  return [...vectorMissingIds].filter((id) => observationById.get(id)?.projectId === projectId);
+}
+
+/**
+ * Get a summary of vector embedding status.
+ * Returns total observations, how many have vectors, and how many are missing.
+ */
+export function getVectorStatus(projectId?: string): {
+  total: number;
+  missing: number;
+  missingIds: number[];
+  backfillRunning: boolean;
+  lastBackfill: typeof lastVectorBackfill;
+} {
+  const missingIds = getVectorMissingIds(projectId);
+  return {
+    total: projectId ? observations.filter((observation) => observation.projectId === projectId).length : observations.length,
+    missing: missingIds.length,
+    missingIds,
+    backfillRunning: vectorBackfillRunning,
+    lastBackfill: lastVectorBackfill,
+  };
+}
+
+/**
+ * Return search-index state from the same module graph that owns the hydrated
+ * Orama instance. This avoids split singleton state when tools load Memorix
+ * TypeScript sources through runtime loaders.
+ */
+export function getSearchIndexStatus(projectId?: string): {
+  embeddingEnabled: boolean;
+  vectorDimensions: number | null;
+  lastSearchMode: string;
+  prepared: boolean;
+} {
+  return {
+    embeddingEnabled: isEmbeddingEnabled(),
+    vectorDimensions: getVectorDimensions(),
+    lastSearchMode: getLastSearchMode(projectId),
+    prepared: searchIndexPrepared,
+  };
+}
+
+/**
+ * Observability-only semantic probe. It intentionally disables access tracking
+ * so status checks do not mutate retention/access metadata.
+ */
+export async function probeSearchIndex(projectId: string): Promise<string> {
+  await searchObservations({
+    query: 'semantic memory retrieval status',
+    projectId,
+    reader: { projectId },
+    limit: 1,
+    status: 'all',
+    trackAccess: false,
+  });
+  return getLastSearchMode(projectId);
+}
+
+/**
+ * Attempt to backfill missing vector embeddings.
+ * Re-generates embeddings for observations in vectorMissingIds.
+ * Returns the number successfully backfilled.
+ *
+ * Safe to call concurrently — only one backfill runs at a time.
+ */
+export async function backfillVectorEmbeddings(options: {
+  projectId?: string;
+  limit?: number;
+} = {}): Promise<{
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  lastError?: string;
+}> {
+  if (vectorBackfillRunning) {
+    return { attempted: 0, succeeded: 0, failed: 0 };
+  }
+  vectorBackfillRunning = true;
+
+  const observationById = new Map(observations.map((observation) => [observation.id, observation]));
+  const limit = Number.isFinite(options.limit)
+    ? Math.max(1, Math.floor(options.limit!))
+    : Number.POSITIVE_INFINITY;
+  const ids = [...vectorMissingIds]
+    .filter((id) => !options.projectId || observationById.get(id)?.projectId === options.projectId)
+    .slice(0, limit);
+  let succeeded = 0;
+  let failed = 0;
+  let lastFailure: string | undefined;
+  const recordFailure = (message: string): void => {
+    // A single batch may have several symptoms after one root cause. Preserve
+    // the first one so an informative provider/index error is not overwritten
+    // by later missing-result fallout.
+    if (!lastFailure) lastFailure = message;
+  };
+
+  const candidates: Array<{ id: number; observation: Observation; text: string }> = [];
+  for (const id of ids) {
+    const observation = observationById.get(id);
+    if (!observation) {
+      vectorMissingIds.delete(id);
+      continue;
+    }
+    candidates.push({
+      id,
+      observation,
+      text: [observation.title, observation.narrative, ...observation.facts].join(' '),
+    });
+  }
+
+  try {
+    if (candidates.length === 0) {
+      return { attempted: ids.length, succeeded, failed };
+    }
+
+    let embeddings: number[][] | null = null;
+    try {
+      const provider = await getEmbeddingProvider();
+      if (!provider) {
+        if (isEmbeddingExplicitlyDisabled()) {
+          for (const candidate of candidates) vectorMissingIds.delete(candidate.id);
+        } else {
+          recordFailure('embedding provider unavailable');
+          failed += candidates.length;
+        }
+      } else {
+        // API providers batch and cache this efficiently; local providers can use
+        // their native batch path. Index writes stay sequential because Orama is
+        // process-local mutable state.
+        embeddings = await provider.embedBatch(candidates.map((candidate) => candidate.text));
+      }
+    } catch (error) {
+      recordFailure(vectorBackfillError(error));
+      failed += candidates.length;
+    }
+
+    if (embeddings) {
+      for (let index = 0; index < candidates.length; index++) {
+        const { id, observation: obs } = candidates[index];
+        const embedding = embeddings[index];
+        if (!embedding || embedding.length === 0) {
+          recordFailure('embedding provider returned no vector');
+          failed++;
+          continue;
+        }
+        try {
+          if (!isVectorCompatibleWithCurrentIndex(embedding)) {
+            await upgradeVectorSchemaAfterFirstEmbedding(embedding);
+          }
+          if (!isVectorCompatibleWithCurrentIndex(embedding)) {
+            const vectorDimensions = getVectorDimensions();
+            console.error(
+              `[memorix] Backfill embedding mismatch for obs-${id}: provider returned ${embedding.length}d, index expects ${vectorDimensions ?? 'unknown'}d (kept in queue)`,
+            );
+            recordFailure(`dimension mismatch: provider returned ${embedding.length}d, index expects ${vectorDimensions ?? 'unknown'}d`);
+            failed++;
+            continue;
+          }
+          const oramaId = makeOramaObservationId(obs.projectId, obs.id);
+          try {
+            const { removeObservation: removeObs } = await import('../store/orama-store.js');
+            await removeObs(oramaId);
+          } catch { /* may not exist */ }
+          const doc: MemorixDocument = {
+            id: oramaId,
+            observationId: obs.id,
+            entityName: obs.entityName,
+            type: obs.type,
+            title: obs.title,
+            narrative: obs.narrative,
+            facts: obs.facts.join('\n'),
+            filesModified: obs.filesModified.join('\n'),
+            concepts: obs.concepts.map(c => c.replace(/-/g, ' ')).join(', '),
+            attachments: formatAttachmentProvenance(obs.attachments),
+            tokens: obs.tokens,
+            createdAt: obs.createdAt,
+            projectId: obs.projectId,
+            accessCount: 0,
+            lastAccessedAt: '',
+            status: obs.status ?? 'active',
+            source: obs.source ?? 'agent',
+            sourceDetail: obs.sourceDetail ?? '',
+            valueCategory: obs.valueCategory ?? '',
+            admissionState: obs.admissionState ?? '',
+            admissionReason: obs.admissionReason ?? '',
+            visibility: obs.visibility ?? 'project',
+            createdByAgentId: obs.createdByAgentId ?? '',
+            sharedWithAgentIds: JSON.stringify(obs.sharedWithAgentIds ?? []),
+            embedding,
+          };
+          await insertObservation(doc);
+          vectorMissingIds.delete(id);
+          succeeded++;
+        } catch (error) {
+          recordFailure(vectorBackfillError(error));
+          failed++;
+        }
+      }
+    }
+  } finally {
+    vectorBackfillRunning = false;
+    lastVectorBackfill = {
+      attempted: ids.length,
+      succeeded,
+      failed,
+      ...(lastFailure ? { lastError: lastFailure } : {}),
+      finishedAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    attempted: ids.length,
+    succeeded,
+    failed,
+    ...(lastFailure ? { lastError: lastFailure } : {}),
+  };
 }

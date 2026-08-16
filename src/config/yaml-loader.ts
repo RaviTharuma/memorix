@@ -16,14 +16,23 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { parse as parseYamlDocument } from 'yaml';
+import { getGlobalYamlPath, getProjectYamlPath } from './config-paths.js';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface MemorixYamlConfig {
   /** LLM provider configuration */
   llm?: {
+    provider?: 'openai' | 'anthropic' | 'openrouter' | string;
+    model?: string;
+    apiKey?: string;
+    baseUrl?: string;
+  };
+
+  /** TUI / chat agent LLM provider configuration */
+  agent?: {
     provider?: 'openai' | 'anthropic' | 'openrouter' | string;
     model?: string;
     apiKey?: string;
@@ -39,6 +48,14 @@ export interface MemorixYamlConfig {
     dimensions?: number;
   };
 
+  /** Remote neural rerank (HTTP only) */
+  rerank?: {
+    provider?: 'off' | 'jina' | 'http' | string;
+    model?: string;
+    apiKey?: string;
+    baseUrl?: string;
+  };
+
   /** Git-Memory pipeline configuration */
   git?: {
     /** Auto-install post-commit hook on first run (default: false) */
@@ -51,8 +68,22 @@ export interface MemorixYamlConfig {
     skipMergeCommits?: boolean;
     /** File patterns to exclude from git memory (glob) */
     excludePatterns?: string[];
-    /** Additional commit message patterns to treat as noise (regex strings) */
+    /** Additional commit message phrases to treat as noise (literal, case-insensitive) */
     noiseKeywords?: string[];
+  };
+
+  /** CodeGraph / Project Context configuration */
+  codegraph?: {
+    /** File patterns to exclude from CodeGraph indexing and context suggestions */
+    excludePatterns?: string[];
+    /** Maximum source file size to parse into CodeGraph Memory */
+    maxFileBytes?: number;
+    /** Use a healthy pre-existing local CodeGraph index when present (default: auto). */
+    externalContext?: 'auto' | 'off';
+    /** Optional CodeGraph executable path when it is not available on PATH. */
+    externalCommand?: string;
+    /** Bound for one local semantic context request. */
+    externalTimeoutMs?: number;
   };
 
   /** Behavior settings */
@@ -79,29 +110,24 @@ export interface MemorixYamlConfig {
     dashboardPort?: number;
   };
 
-  /** Team collaboration settings */
+  /** Orchestration coordination settings */
   team?: {
-    /** Enable team features */
+    /** Enable orchestration coordination features */
     enabled?: boolean;
     /** Shared workspace memory collection */
     workspaceCollection?: string;
   };
 
-  /** Additional MCP servers to aggregate (Memorix as hub) */
-  mcpServers?: Record<string, {
-    type?: 'stdio' | 'sse';
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    url?: string;
-  }>;
+  // NOTE: a previous `mcpServers` declaration ("Memorix as an MCP hub") was
+  // removed — no code ever consumed it. Unknown top-level keys are ignored,
+  // so existing files with the old key keep loading without error.
 }
 
 // ─── Loader ──────────────────────────────────────────────────────────
 
-let cachedYamlConfig: MemorixYamlConfig | null = null;
-let cachedProjectRoot: string | null = null;
-
+// Per-project config cache — keyed by resolved projectRoot string.
+// null key = user-level-only config (no project root).
+const configCache = new Map<string | null, MemorixYamlConfig>();
 /** Stored project root — set once by server init, used by all no-arg loadYamlConfig() calls */
 let globalProjectRoot: string | null = null;
 
@@ -109,29 +135,39 @@ let globalProjectRoot: string | null = null;
  * Set the project root for YAML config resolution.
  * Call this once during server init so all config getters
  * (which call loadYamlConfig() without args) pick up project-level memorix.yml.
+ *
+ * In HTTP mode, this is called per-session/switchProject — the Map cache
+ * preserves configs for all projects simultaneously.
  */
 export function initProjectRoot(root: string): void {
   globalProjectRoot = root;
-  // Invalidate cache so next loadYamlConfig() reloads with the new root
-  cachedYamlConfig = null;
-  cachedProjectRoot = null;
+  // Invalidate this project's cache entry so file changes are picked up
+  configCache.delete(root);
+}
+
+/**
+ * Clear the global project root used by no-arg loadYamlConfig().
+ * Useful when a long-lived process switches to a project whose root is unknown.
+ */
+export function clearProjectRoot(): void {
+  globalProjectRoot = null;
 }
 
 /**
  * Load memorix.yml from project root and/or user home.
  * Project-level overrides user-level (shallow merge per top-level key).
  */
-export function loadYamlConfig(projectRoot?: string): MemorixYamlConfig {
-  // Fall back to globally-initialized project root when no explicit root is given
-  const resolvedRoot = projectRoot ?? globalProjectRoot ?? null;
+export function loadYamlConfig(projectRoot?: string | null): MemorixYamlConfig {
+  // When null is explicitly passed, skip global fallback (user-level config only).
+  // When undefined (no arg), fall back to globally-initialized project root.
+  const resolvedRoot = projectRoot === null ? null : (projectRoot ?? globalProjectRoot ?? null);
 
-  // Cache invalidation: if project root changed, reload
-  if (cachedYamlConfig !== null && cachedProjectRoot === resolvedRoot) {
-    return cachedYamlConfig;
-  }
+  // Per-project cache hit
+  const cached = configCache.get(resolvedRoot ?? null);
+  if (cached) return cached;
 
-  const userYaml = join(homedir(), '.memorix', 'memorix.yml');
-  const projectYaml = resolvedRoot ? join(resolvedRoot, 'memorix.yml') : null;
+  const userYaml = getGlobalYamlPath(homedir());
+  const projectYaml = resolvedRoot ? getProjectYamlPath(resolvedRoot) : null;
 
   let userConfig: MemorixYamlConfig = {};
   let projectConfig: MemorixYamlConfig = {};
@@ -155,52 +191,45 @@ export function loadYamlConfig(projectRoot?: string): MemorixYamlConfig {
   }
 
   // Shallow merge: project-level top keys override user-level
-  cachedYamlConfig = {
+  const merged: MemorixYamlConfig = {
     ...userConfig,
     ...projectConfig,
     // Deep merge for nested objects where both exist
     llm: { ...userConfig.llm, ...projectConfig.llm },
+    agent: { ...userConfig.agent, ...projectConfig.agent },
     embedding: { ...userConfig.embedding, ...projectConfig.embedding },
+    rerank: { ...userConfig.rerank, ...projectConfig.rerank },
     git: { ...userConfig.git, ...projectConfig.git },
+    codegraph: { ...userConfig.codegraph, ...projectConfig.codegraph },
     behavior: { ...userConfig.behavior, ...projectConfig.behavior },
     server: { ...userConfig.server, ...projectConfig.server },
     team: { ...userConfig.team, ...projectConfig.team },
   };
-  cachedProjectRoot = resolvedRoot;
+  configCache.set(resolvedRoot ?? null, merged);
 
-  return cachedYamlConfig;
+  return merged;
 }
 
 /**
  * Reset cached YAML config (for testing or project switching).
+ * Invalidates all cached entries, or a specific projectRoot if provided.
  */
-export function resetYamlConfigCache(): void {
-  cachedYamlConfig = null;
-  cachedProjectRoot = null;
+export function resetYamlConfigCache(projectRoot?: string | null): void {
+  if (projectRoot !== undefined) {
+    configCache.delete(projectRoot ?? null);
+  } else {
+    configCache.clear();
+  }
 }
 
-/**
- * Parse YAML string using gray-matter's internal js-yaml.
- * gray-matter is already a dependency — no new deps needed.
- */
 function parseYaml(content: string): MemorixYamlConfig {
-  // gray-matter uses js-yaml internally; we import it from there
-  // But for simplicity and reliability, use a basic YAML parser
-  // that handles the flat config structure we need.
   try {
-    // Dynamic import of js-yaml through gray-matter's dependency
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const yaml = require('js-yaml');
-    return yaml.load(content) as MemorixYamlConfig ?? {};
+    const parsed = parseYamlDocument(content);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+      ? parsed as MemorixYamlConfig
+      : {};
   } catch {
-    // Fallback: try gray-matter which wraps js-yaml
-    try {
-      const matter = require('gray-matter');
-      const parsed = matter(`---\n${content}\n---`);
-      return (parsed.data as MemorixYamlConfig) ?? {};
-    } catch {
-      console.error('[memorix] YAML parse failed — check memorix.yml syntax');
-      return {};
-    }
+    console.error('[memorix] YAML parse failed — check memorix.yml syntax');
+    return {};
   }
 }

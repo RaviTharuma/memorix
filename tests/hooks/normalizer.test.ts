@@ -54,7 +54,7 @@ describe('Hook Normalizer', () => {
       expect(input.toolName).toBe('read_file');
     });
 
-    it('should detect Antigravity/Gemini CLI from gemini_session_id', () => {
+    it('should detect Antigravity from gemini_session_id', () => {
       const input = normalizeHookInput({
         hook_event_name: 'AfterTool',
         gemini_session_id: 'gem-123',
@@ -64,6 +64,73 @@ describe('Hook Normalizer', () => {
       expect(input.agent).toBe('antigravity');
       expect(input.event).toBe('post_tool');
       expect(input.toolName).toBe('write_file');
+    });
+
+    it('should detect Gemini CLI from _memorix_agent override', () => {
+      const input = normalizeHookInput({
+        hook_event_name: 'AfterTool',
+        cwd: '/project',
+        tool_name: 'edit_file',
+        _memorix_agent: 'gemini-cli',
+      });
+      expect(input.agent).toBe('gemini-cli');
+      expect(input.event).toBe('post_tool');
+      expect(input.toolName).toBe('edit_file');
+    });
+
+    it('normalizes the documented CodeBuddy hook payload through its explicit plugin identity', () => {
+      const input = normalizeHookInput({
+        _memorix_agent: 'codebuddy',
+        hook_event_name: 'PostToolUse',
+        session_id: 'codebuddy-1',
+        cwd: '/project',
+        tool_name: 'Edit',
+        tool_input: { file_path: '/project/src/index.ts' },
+      });
+      expect(input.agent).toBe('codebuddy');
+      expect(input.event).toBe('post_tool');
+      expect(input.sessionId).toBe('codebuddy-1');
+      expect(input.toolName).toBe('Edit');
+    });
+
+    it('_memorix_agent takes priority over all other detection heuristics', () => {
+      // Even with gemini_session_id (which normally → antigravity), _memorix_agent wins
+      const input = normalizeHookInput({
+        hook_event_name: 'SessionStart',
+        gemini_session_id: 'gem-999',
+        _memorix_agent: 'gemini-cli',
+      });
+      expect(input.agent).toBe('gemini-cli');
+    });
+
+    it('should still detect Antigravity when _memorix_agent is not present', () => {
+      const input = normalizeHookInput({
+        hook_event_name: 'SessionStart',
+        gemini_session_id: 'gem-999',
+      });
+      expect(input.agent).toBe('antigravity');
+    });
+
+    it('should detect Antigravity from generated plugin override and official payload fields', () => {
+      const input = normalizeHookInput({
+        _memorix_agent: 'antigravity',
+        _memorix_event: 'PreToolUse',
+        conversationId: 'ag-123',
+        workspacePaths: ['/project'],
+        transcriptPath: '/tmp/transcript.jsonl',
+        toolCall: {
+          name: 'run_command',
+          args: { CommandLine: 'npm test' },
+        },
+      });
+
+      expect(input.agent).toBe('antigravity');
+      expect(input.event).toBe('post_tool');
+      expect(input.sessionId).toBe('ag-123');
+      expect(input.cwd).toBe('/project');
+      expect(input.transcriptPath).toBe('/tmp/transcript.jsonl');
+      expect(input.toolName).toBe('run_command');
+      expect(input.toolInput).toEqual({ CommandLine: 'npm test' });
     });
   });
 
@@ -140,6 +207,19 @@ describe('Hook Normalizer', () => {
       expect(input.event).toBe('pre_compact');
     });
 
+    it('should normalize Antigravity PreInvocation → session_start', () => {
+      const input = normalizeHookInput({
+        _memorix_agent: 'antigravity',
+        _memorix_event: 'PreInvocation',
+        conversationId: 'ag-2',
+        workspacePaths: ['/project'],
+      });
+
+      expect(input.agent).toBe('antigravity');
+      expect(input.event).toBe('session_start');
+      expect(input.sessionId).toBe('ag-2');
+    });
+
     it('should normalize Windsurf post_cascade_response → post_response', () => {
       const input = normalizeHookInput({
         agent_action_name: 'post_cascade_response',
@@ -148,6 +228,131 @@ describe('Hook Normalizer', () => {
       });
       expect(input.event).toBe('post_response');
       expect(input.aiResponse).toBe('I fixed the bug by...');
+    });
+
+    it('should normalize OpenCode message.updated → post_response with aiResponse', () => {
+      const input = normalizeHookInput({
+        agent: 'opencode',
+        hook_event_name: 'message.updated',
+        ai_response: 'Finished implementing the fix and updated the tests.',
+        session_id: 'oc-1',
+        cwd: '/project',
+      });
+      expect(input.agent).toBe('opencode');
+      expect(input.event).toBe('post_response');
+      expect(input.aiResponse).toBe('Finished implementing the fix and updated the tests.');
+    });
+
+    it('should normalize Pi package extension tool_result events', () => {
+      const input = normalizeHookInput({
+        agent: 'pi',
+        hook_event_name: 'pi.tool_result',
+        session_id: 'pi-1',
+        cwd: '/project',
+        tool_name: 'write',
+        tool_input: { path: '/project/src/app.ts' },
+        tool_result: { content: [{ type: 'text', text: 'wrote file' }] },
+      });
+      expect(input.agent).toBe('pi');
+      expect(input.event).toBe('post_tool');
+      expect(input.toolName).toBe('write');
+      expect(input.filePath).toBe('/project/src/app.ts');
+      expect(input.toolResult).toContain('wrote file');
+    });
+
+    it('should normalize Pi package extension prompt and response events', () => {
+      const prompt = normalizeHookInput({
+        agent: 'pi',
+        hook_event_name: 'pi.before_agent_start',
+        prompt: 'continue the plugin integration',
+        cwd: '/project',
+      });
+      expect(prompt.event).toBe('user_prompt');
+      expect(prompt.userPrompt).toBe('continue the plugin integration');
+
+      const response = normalizeHookInput({
+        agent: 'pi',
+        hook_event_name: 'pi.agent_end',
+        ai_response: 'Implemented the Pi package and verified setup.',
+        cwd: '/project',
+      });
+      expect(response.event).toBe('post_response');
+      expect(response.aiResponse).toBe('Implemented the Pi package and verified setup.');
+    });
+
+    it('should normalize Oh-my-Pi package extension events', () => {
+      const input = normalizeHookInput({
+        agent: 'omp',
+        hook_event_name: 'omp.tool_result',
+        session_id: 'omp-1',
+        cwd: '/project',
+        tool_name: 'write',
+        tool_input: { path: '/project/src/omp.ts' },
+        tool_result: { content: [{ type: 'text', text: 'wrote omp file' }] },
+      });
+      expect(input.agent).toBe('omp');
+      expect(input.event).toBe('post_tool');
+      expect(input.toolName).toBe('write');
+      expect(input.filePath).toBe('/project/src/omp.ts');
+      expect(input.toolResult).toContain('wrote omp file');
+    });
+
+    it('should normalize Hermes plugin hook wrapper events', () => {
+      const prompt = normalizeHookInput({
+        agent: 'hermes',
+        hook_event_name: 'hermes.pre_llm_call',
+        session_id: 'hermes-1',
+        payload: {
+          kwargs: {
+            cwd: '/project',
+            prompt: 'load relevant memorix context',
+          },
+        },
+      });
+      expect(prompt.agent).toBe('hermes');
+      expect(prompt.event).toBe('user_prompt');
+      expect(prompt.cwd).toBe('/project');
+      expect(prompt.userPrompt).toBe('load relevant memorix context');
+
+      const response = normalizeHookInput({
+        agent: 'hermes',
+        hook_event_name: 'hermes.post_llm_call',
+        payload: {
+          kwargs: {
+            ai_response: 'Hermes plugin captured the response.',
+          },
+        },
+      });
+      expect(response.event).toBe('post_response');
+      expect(response.aiResponse).toBe('Hermes plugin captured the response.');
+    });
+
+    it('should normalize OpenClaw hook-pack lifecycle events', () => {
+      const bootstrap = normalizeHookInput({
+        agent: 'openclaw',
+        hook_event_name: 'openclaw.agent:bootstrap',
+        session_id: 'oclaw-1',
+        openclaw_event: {
+          sessionKey: 'session-key',
+          context: {
+            cwd: '/project',
+          },
+        },
+      });
+      expect(bootstrap.agent).toBe('openclaw');
+      expect(bootstrap.event).toBe('session_start');
+      expect(bootstrap.sessionId).toBe('oclaw-1');
+      expect(bootstrap.cwd).toBe('/project');
+
+      const compact = normalizeHookInput({
+        agent: 'openclaw',
+        hook_event_name: 'openclaw.session:compact:before',
+        openclaw_event: {
+          sessionKey: 'session-key',
+        },
+      });
+      expect(compact.event).toBe('pre_compact');
+      expect(compact.sessionId).toBe('session-key');
     });
 
     it('should normalize Windsurf MCP tool use', () => {

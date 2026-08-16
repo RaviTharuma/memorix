@@ -8,6 +8,65 @@
 import { defineCommand } from 'citty';
 import * as p from '@clack/prompts';
 
+type IngestableCommit = {
+  hash: string;
+  shortHash: string;
+  subject: string;
+};
+
+type IngestLogResult = {
+  stored: number;
+  dupSkipped: number;
+  errSkipped: number;
+};
+
+export function parseCommitCount(value?: string): number {
+  const raw = value?.trim() || '10';
+  if (!/^\d+$/.test(raw)) {
+    throw new Error('Commit count must be an integer between 1 and 100.');
+  }
+  const count = Number(raw);
+  if (!Number.isSafeInteger(count) || count < 1 || count > 100) {
+    throw new Error('Commit count must be an integer between 1 and 100.');
+  }
+  return count;
+}
+
+/**
+ * Shared dedup logic for batch git ingest.
+ * Exported so tests can exercise the production path rather than reimplementing it.
+ */
+export async function ingestCommitsWithDedup<T extends IngestableCommit>(
+  commits: T[],
+  existingHashes: Set<string>,
+  ingestOne: (commit: T) => Promise<void>,
+  log: (line: string) => void = console.log,
+): Promise<IngestLogResult> {
+  let stored = 0;
+  let dupSkipped = 0;
+  let errSkipped = 0;
+
+  for (const commit of commits) {
+    if (existingHashes.has(commit.hash)) {
+      dupSkipped++;
+      log(`  [SKIP] ${commit.shortHash} ${commit.subject} — already ingested`);
+      continue;
+    }
+    try {
+      await ingestOne(commit);
+      stored++;
+      existingHashes.add(commit.hash);
+      log(`  [OK] ${commit.shortHash} ${commit.subject}`);
+    } catch (err) {
+      errSkipped++;
+      const message = err instanceof Error ? err.message : String(err);
+      log(`  [SKIP] ${commit.shortHash} ${commit.subject} — error: ${message}`);
+    }
+  }
+
+  return { stored, dupSkipped, errSkipped };
+}
+
 export default defineCommand({
   meta: {
     name: 'log',
@@ -25,7 +84,14 @@ export default defineCommand({
     let cwd: string;
     try { cwd = process.cwd(); } catch { cwd = os.homedir(); }
 
-    const count = parseInt(args.count || '10', 10);
+    let count: number;
+    try {
+      count = parseCommitCount(args.count);
+    } catch (err) {
+      p.log.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+      return;
+    }
 
     p.intro(`Ingest recent ${count} commits`);
 
@@ -66,7 +132,7 @@ export default defineCommand({
         console.log('');
         console.log(`  Filtered (noise):`);
         for (const { commit, reason } of noiseCommits) {
-          console.log(`  ⏭️ ${commit.shortHash} ${commit.subject} — ${reason}`);
+          console.log(`  [SKIP] ${commit.shortHash} ${commit.subject} — ${reason}`);
         }
       }
       console.log('');
@@ -85,6 +151,7 @@ export default defineCommand({
       const { initObservations, storeObservation } = await import('../../memory/observations.js');
       const { getProjectDataDir } = await import('../../store/persistence.js');
       const { detectProject } = await import('../../project/detector.js');
+      const { initObservationStore, getObservationStore: getStore } = await import('../../store/obs-store.js');
 
       const project = detectProject(cwd);
       if (!project) {
@@ -92,18 +159,25 @@ export default defineCommand({
         return;
       }
       const dataDir = await getProjectDataDir(project.id);
+      await initObservationStore(dataDir);
       await initObservations(dataDir);
 
-      let stored = 0;
-      let skipped = 0;
+      // Dedup: load existing commit hashes to skip already-ingested commits (#48)
+      const existingObs = await getStore().loadAll() as Array<{ commitHash?: string }>;
+      const existingHashes = new Set(
+        existingObs.map(o => o.commitHash).filter((hash): hash is string => typeof hash === 'string' && hash.length > 0),
+      );
 
-      for (const commit of commits) {
-        try {
+      const { stored, dupSkipped, errSkipped } = await ingestCommitsWithDedup(
+        commits,
+        existingHashes,
+        async (commit) => {
           const result = ingestCommit(commit);
           await storeObservation({
             entityName: result.entityName,
             type: result.type as any,
             title: result.title,
+            sourceDetail: 'git-ingest',
             narrative: result.narrative,
             facts: result.facts,
             concepts: result.concepts,
@@ -112,18 +186,18 @@ export default defineCommand({
             source: 'git',
             commitHash: commit.hash,
           });
-          stored++;
-          console.log(`  ✅ ${commit.shortHash} ${commit.subject}`);
-        } catch {
-          skipped++;
-          console.log(`  ⏭️ ${commit.shortHash} (skipped)`);
-        }
-      }
+        },
+        console.log,
+      );
 
-      p.outro(`Ingested ${stored} commits, skipped ${skipped}.`);
+      const parts = [`Ingested ${stored}/${commits.length} commits`];
+      if (dupSkipped) parts.push(`${dupSkipped} already stored`);
+      if (errSkipped) parts.push(`${errSkipped} errors`);
+      p.outro(parts.join(', ') + '.');
     } catch (err) {
       console.error(`Failed to ingest log: ${err}`);
       p.outro('Ingest failed. Make sure you are in a git repository.');
+      process.exitCode = 1;
     }
   },
 });

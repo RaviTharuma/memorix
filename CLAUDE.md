@@ -1,56 +1,92 @@
-# Memorix — Agent Instructions for Claude Code
+# Memorix - Agent Instructions for Claude Code
 
-You have access to Memorix, a cross-agent memory system. Use it to persist and recall project knowledge across sessions.
+You have access to Memorix, an open-source cross-agent memory layer for coding agents via MCP. Use it to persist and recall project knowledge across sessions, preserve reasoning, and retrieve Git-backed engineering truth when relevant.
 
-## When to SEARCH memory (memorix_search)
+## Using Memorix Memory Tools
 
-- **Session start**: Always search for recent context at the beginning of a conversation
-- **Before making decisions**: Search for past decisions on the same topic
-- **When the user asks "remember"/"what did we"/"last time"**: Search for relevant history
-- **Before implementing features**: Check if similar work was done before
-- **When encountering errors**: Search for known gotchas and past solutions
+This project has Memorix MCP tools available for persistent cross-session memory.
 
-## When to STORE memory (memorix_store)
+For broad continuation or a fresh handoff, start with Memory Autopilot before
+progress files, dev-log reads, ad-hoc file reads, or git archaeology:
 
-- **Architecture decisions**: Why you chose X over Y (type: `decision`)
-- **Bug fixes**: Root cause and solution (type: `problem-solution`)
-- **Gotchas/pitfalls**: Things that tripped you up (type: `gotcha`)
-- **How things work**: Non-obvious system behavior (type: `how-it-works`)
-- **Changes made**: Significant code changes (type: `what-changed`)
-- **Trade-offs**: Compromises and their reasoning (type: `trade-off`)
-- **Session goals**: What the user asked for at session start (type: `session-request`)
+- MCP: `memorix_project_context` with the current task
+- Default first step for non-trivial coding work: call
+  `memorix_project_context` with the user's actual task. Memorix will choose a
+  task-lensed brief (bugfix, feature, release, onboarding, refactor, docs, test,
+  or general). Treat its "Start here" files as the first project files to
+  inspect.
+- Claude Code exposes MCP tools through dynamic tool loading. If the tool is not
+  directly visible in the first tool list, search/select the Memorix project
+  context tool before using shell fallback.
+- CLI fallback: only after MCP is confirmed unavailable, run
+  `memorix context --task "<current task>"` from the shell instead of skipping
+  memory or hand-writing tool calls
+- Do not skip project memory just because the initial MCP status says `pending`
 
-## When to check RETENTION (memorix_retention)
+Claude Code starts MCP servers asynchronously. An initial `pending` MCP status is
+not a failure by itself; the tools may appear through dynamic tool loading after
+startup. The reliable user-facing fallback is the `memorix context` CLI command,
+but fallback should come after the MCP-first attempt.
 
-- Periodically check which memories are stale or candidates for archiving
-- Review top-relevant memories to avoid duplicating past work
+### When to search memory
 
-## Best Practices
+Use `memorix_search` when prior project context would help — for example:
+- The user asks about a past decision, bug, or change
+- You need to understand why something was designed a certain way
+- You're continuing work that started in a previous session
 
-1. **Be specific in titles**: "Fixed Docker timeout from 30s to 60s" not "Fixed bug"
-2. **Include facts**: Structured data like "Default port: 3001", "Retry count: 3"
-3. **Tag files**: Always include filesModified when you edit files
-4. **Use concepts**: Add searchable keywords for future retrieval
-5. **Don't over-store**: Only store knowledge that would be useful in a future session
-6. **Entity naming**: Use kebab-case descriptive names like "auth-module", "docker-config"
+You do **not** need to search memory for simple, self-contained tasks.
 
-## Tool Quick Reference
+If no memories exist yet, that's fine — just proceed normally.
 
-| Tool | When | Example |
-|------|------|---------|
-| `memorix_search` | Find past knowledge | `query: "authentication"` |
-| `memorix_store` | Save new knowledge | `type: "decision", title: "Use JWT for auth"` |
-| `memorix_detail` | Get full observation | `ids: [42, 43]` |
-| `memorix_timeline` | See what happened around an event | `anchorId: 42` |
-| `memorix_resolve` | Mark task done / bug fixed | `ids: [42]` |
-| `memorix_session_start` | Load context at session start | (no params needed) |
-| `memorix_session_end` | Save session summary | `summary: "## Goal\n..."` |
-| `memorix_promote` | Make observation permanent | `action: "promote", observationIds: [42]` |
-| `memorix_retention` | Check memory health | `action: "report"` |
-| `memorix_transfer` | Export/import memories | `action: "export"` |
-| `memorix_rules_sync` | Sync agent rules | `action: "status"` |
-| `memorix_workspace_sync` | Migrate workspace configs | `action: "scan"` |
-| `team_manage` | Register agent | `action: "join", name: "claude-backend"` |
-| `team_file_lock` | Lock file before editing | `action: "lock", file: "src/auth.ts"` |
-| `team_task` | Create/claim tasks | `action: "create", description: "Fix auth bug"` |
-| `team_message` | Send message to other agent | `action: "send", to: "agent-id"` |
+### When to store memory
+
+Use `memorix_store` when you learn something a future session should not have to rediscover:
+
+| What happened | Type |
+|---|---|
+| Architecture or design decision | `decision` |
+| Bug found and fixed | `problem-solution` |
+| Non-obvious pitfall or gotcha | `gotcha` |
+| Config or dependency changed | `what-changed` |
+| Trade-off discussed with conclusion | `trade-off` |
+
+**Tips:** Use concise titles (~5-10 words). Include `filesModified` when relevant. Use `topicKey` for evolving topics. For "why" decisions, use `memorix_store_reasoning`.
+
+**Don't store:** greetings, simple file reads, trivial commands.
+
+### When to resolve memory
+
+Use `memorix_resolve` when a task is done or a bug is fixed. This keeps future searches focused on active work.
+
+### Tools quick reference
+
+The installed `memorix serve --mode lite` surface exposes every tool below
+except the three marked `MEMORIX_MODE=full` (set that env var or `--mode full`
+to enable them).
+
+| Tool | Use when |
+|---|---|
+| `memorix_search` | Find relevant past context |
+| `memorix_detail` | Read full content of a specific memory |
+| `memorix_project_context` | Get the compact Memory Autopilot brief for a fresh task |
+| `memorix_context_pack` | Get structured context when the agent needs refs/freshness |
+| `memorix_store` | Save something worth persisting |
+| `memorix_store_reasoning` | Save the "why" behind a decision |
+| `memorix_resolve` | Mark completed/outdated memories |
+| `memorix_session_start` | Load session context (handoff, team coordination) |
+| `memorix_timeline` | See chronological context around a memory |
+| `memorix_retention` | Check memory health and archive expired items |
+| `memorix_promote` (MEMORIX_MODE=full) | Turn repeated patterns into permanent skills |
+| `memorix_rules_sync` (MEMORIX_MODE=full) | Inspect or sync rules across agents |
+| `memorix_workspace_sync` (MEMORIX_MODE=full) | Inspect or migrate workspace integrations |
+
+## Active Work
+
+- **Repository-wide current state**: `ACTIVE_WORK.md`
+- Read that file after the Memory Autopilot step for long-running release or
+  development work.
+- It is the only living work-status document. Update it after material
+  cross-session work; do not create parallel progress or dev-log files.
+- It must stay public-safe: no local absolute paths, account identifiers,
+  credentials, raw chat transcripts, or local tool state.

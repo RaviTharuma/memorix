@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('../../src/embedding/provider.js', () => ({
   getEmbeddingProvider: async () => null,
   isVectorSearchAvailable: async () => false,
+  isEmbeddingExplicitlyDisabled: () => true,
   resetProvider: () => {},
 }));
 
@@ -17,13 +18,19 @@ import { exportAsJson, exportAsMarkdown, importFromJson } from '../../src/memory
 import { storeObservation, initObservations, getObservationCount } from '../../src/memory/observations.js';
 import { resetDb } from '../../src/store/orama-store.js';
 import { startSession, endSession } from '../../src/memory/session.js';
+import { initObservationStore, resetObservationStore } from '../../src/store/obs-store.js';
+import { initSessionStore, resetSessionStore } from '../../src/store/session-store.js';
 
 let testDir: string;
 const PROJECT_ID = 'test/export-import';
 
 beforeEach(async () => {
   testDir = await fs.mkdtemp(path.join(os.tmpdir(), 'memorix-export-'));
+  resetObservationStore();
+  resetSessionStore();
   await resetDb();
+  await initObservationStore(testDir);
+  await initSessionStore(testDir);
   await initObservations(testDir);
 });
 
@@ -76,6 +83,37 @@ describe('Export', () => {
     expect(dataA.observations[0].title).toBe('Project A decision');
     expect(dataB.observations).toHaveLength(1);
     expect(dataB.observations[0].title).toBe('Project B decision');
+  });
+
+  it('filters private and team records through an explicit export reader', async () => {
+    await storeObservation({
+      entityName: 'auth', type: 'decision', title: 'Shared decision',
+      narrative: 'Everyone in the project can use this.', projectId: PROJECT_ID,
+    });
+    await storeObservation({
+      entityName: 'auth', type: 'discovery', title: 'Private triage',
+      narrative: 'Only its owner can export this.', projectId: PROJECT_ID,
+      visibility: 'personal', createdByAgentId: 'agent-owner',
+    });
+    await storeObservation({
+      entityName: 'auth', type: 'discovery', title: 'Team triage',
+      narrative: 'Only active team members can export this.', projectId: PROJECT_ID,
+      visibility: 'team', createdByAgentId: 'agent-owner',
+    });
+
+    const unbound = await exportAsJson(testDir, PROJECT_ID, { projectId: PROJECT_ID });
+    expect(unbound.observations.map((observation) => observation.title)).toEqual(['Shared decision']);
+
+    const owner = await exportAsJson(testDir, PROJECT_ID, {
+      projectId: PROJECT_ID,
+      agentId: 'agent-owner',
+      isTeamMember: true,
+    });
+    expect(owner.observations.map((observation) => observation.title)).toEqual([
+      'Shared decision',
+      'Private triage',
+      'Team triage',
+    ]);
   });
 
   it('should export as readable Markdown', async () => {
@@ -137,6 +175,10 @@ describe('Import', () => {
     const exported = await exportAsJson(testDir, PROJECT_ID);
 
     const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), 'memorix-import-'));
+    resetObservationStore();
+    resetSessionStore();
+    await initObservationStore(targetDir);
+    await initSessionStore(targetDir);
     await initObservations(targetDir);
 
     const result = await importFromJson(targetDir, exported);

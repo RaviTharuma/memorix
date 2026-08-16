@@ -2,27 +2,36 @@
  * Hook Handler
  *
  * Unified entry point for all agent hooks.
- * Architecture: Normalize → Classify → Policy → Store → Respond
+ * Architecture: Normalize → Classify → Admit → Store → Respond
  *
  * Design principles (inspired by claude-mem + mcp-memory-service):
- * - Store-first: capture generously, filter at read time
+ * - Candidate-first: automatic capture is never durable context by default
  * - Tool Taxonomy: declarative policies per tool category
  * - Pattern = classification only: determines observation type, not storage
  */
 
+import { createHash } from 'node:crypto';
 import type { ObservationType } from '../types.js';
+import {
+  assessHookAdmission,
+  type HookAdmissionDecision,
+  type HookCaptureCategory,
+} from './admission.js';
 import { normalizeHookInput } from './normalizer.js';
 import { detectBestPattern, patternToObservationType } from './pattern-detector.js';
 import { isSignificantKnowledge, isRetrievedResult, isTrivialCommand } from './significance-filter.js';
-import type { HookEvent, HookOutput, NormalizedHookInput } from './types.js';
+import type { AgentName, HookEvent, HookOutput, NormalizedHookInput } from './types.js';
+
+type HookInjectionMode = 'full' | 'minimal' | 'silent';
+type HookContextTarget = 'hook-session-start' | 'hook-user-prompt';
 
 // ─── Constants ───
 
 /** Observation type → emoji mapping (single source of truth) */
 export const TYPE_EMOJI: Record<string, string> = {
-  'gotcha': '🔴', 'decision': '🟤', 'problem-solution': '🟡',
-  'trade-off': '⚖️', 'discovery': '🟣', 'how-it-works': '🔵',
-  'what-changed': '🟢', 'why-it-exists': '🟠', 'session-request': '🎯',
+  'gotcha': '[GOTCHA]', 'decision': '[DECISION]', 'problem-solution': '[FIX]',
+  'trade-off': '[TRADEOFF]', 'discovery': '[DISCOVERY]', 'how-it-works': '[INFO]',
+  'what-changed': '[CHANGE]', 'why-it-exists': '[WHY]', 'session-request': '[SESSION]',
 };
 
 /** Cooldown tracker: eventKey → lastTimestamp */
@@ -34,6 +43,11 @@ const MIN_PROMPT_LENGTH = 20;
 
 /** Max content length (truncate beyond this) */
 const MAX_CONTENT_LENGTH = 4000;
+
+function deriveHookActorId(input: NormalizedHookInput): string {
+  const material = `${input.agent ?? 'unknown'}\u0000${input.sessionId ?? 'unknown'}`;
+  return `hook:${createHash('sha256').update(material).digest('hex').slice(0, 24)}`;
+}
 
 /** Truly trivial commands — standalone navigation/inspection only */
 const NOISE_COMMANDS = [
@@ -49,7 +63,7 @@ const NOISE_COMMANDS = [
 // ─── Tool Taxonomy ───
 
 /** Tool categories for storage policy */
-type ToolCategory = 'file_modify' | 'file_read' | 'command' | 'search' | 'memorix_internal' | 'unknown';
+type ToolCategory = HookCaptureCategory;
 
 /** Storage policy per tool category */
 interface StoragePolicy {
@@ -130,6 +144,13 @@ function isInCooldown(eventKey: string): boolean {
  */
 function markTriggered(eventKey: string): void {
   cooldowns.set(eventKey, Date.now());
+}
+
+function buildCooldownKey(input: NormalizedHookInput, content: string): string {
+  if (input.event === 'user_prompt' || input.event === 'post_response') {
+    return `${input.event}:${input.sessionId}:${content.slice(0, 160)}`;
+  }
+  return `${input.event}:${input.filePath ?? input.command ?? input.toolName ?? 'general'}`;
 }
 
 /**
@@ -226,7 +247,12 @@ function generateTitle(input: NormalizedHookInput, patternType: string): string 
   return `Activity (${patternType})`;
 }
 
-function buildObservation(input: NormalizedHookInput, content: string, category: ToolCategory) {
+function buildObservation(
+  input: NormalizedHookInput,
+  content: string,
+  category: ToolCategory,
+  admission?: Extract<HookAdmissionDecision, { action: 'store' }>,
+) {
   const pattern = detectBestPattern(content);
   const policy = STORAGE_POLICY[category] ?? STORAGE_POLICY.unknown;
   const fallbackType = input.filePath ? 'what-changed' : policy.defaultType;
@@ -245,117 +271,233 @@ function buildObservation(input: NormalizedHookInput, content: string, category:
     ],
     concepts: pattern?.matchedKeywords ?? [],
     filesModified: input.filePath ? [input.filePath] : [],
+    ...(admission ? {
+      valueCategory: admission.valueCategory,
+      admissionState: admission.admissionState,
+      admissionReason: admission.admissionReason,
+      // Automatic capture is private until current code can qualify it for
+      // shared project delivery. The opaque actor is stable within a hook session.
+      visibility: 'personal' as const,
+      createdByAgentId: deriveHookActorId(input),
+    } : {}),
   };
 }
 
 // ─── Session Start Handler ───
 
+async function getHookInjectionMode(input: NormalizedHookInput): Promise<HookInjectionMode> {
+  try {
+    const { getBehaviorConfig } = await import('../config/behavior.js');
+    return getBehaviorConfig({ projectRoot: input.cwd || undefined }).sessionInject;
+  } catch {
+    return 'minimal';
+  }
+}
+
+/**
+ * Assemble the one bounded project brief shared by hook delivery points.
+ * Hooks never retrieve a transcript: this returns only the normal Workset.
+ */
+async function buildHookProjectContext(
+  input: NormalizedHookInput,
+  task: string,
+  target: HookContextTarget,
+): Promise<{ prompt: string; hasContinuation: boolean } | null> {
+  try {
+    const { detectProject } = await import('../project/detector.js');
+    const { getProjectDataDir } = await import('../store/persistence.js');
+    const { initObservationStore, getObservationStore: getStore } = await import('../store/obs-store.js');
+    const { initMiniSkillStore } = await import('../store/mini-skill-store.js');
+    const { initSessionStore } = await import('../store/session-store.js');
+    const { initAliasRegistry, registerAlias } = await import('../project/aliases.js');
+    const { MaintenanceTargetStore } = await import('../runtime/maintenance-targets.js');
+    const { buildAutoProjectContext, formatAutoProjectContextPrompt } = await import('../codegraph/auto-context.js');
+    const { filterReadableObservations } = await import('../memory/visibility.js');
+
+    const rawProject = detectProject(input.cwd || process.cwd());
+    if (!rawProject) return null;
+    const dataDir = await getProjectDataDir(rawProject.id);
+
+    initAliasRegistry(dataDir);
+    const canonicalId = await registerAlias(rawProject);
+    new MaintenanceTargetStore(dataDir).register({
+      projectId: canonicalId,
+      projectRoot: rawProject.rootPath,
+      dataDir,
+    });
+    await initObservationStore(dataDir);
+    await initMiniSkillStore(dataDir);
+    await initSessionStore(dataDir);
+    const activeObservations = filterReadableObservations(
+      await getStore().loadByProject(canonicalId, { status: 'active' }),
+      { projectId: canonicalId },
+    );
+    const context = await buildAutoProjectContext({
+      project: { ...rawProject, id: canonicalId },
+      dataDir,
+      observations: activeObservations,
+      task,
+      refresh: 'auto',
+      reader: { projectId: canonicalId },
+      continuation: 'always',
+      ...(input.sessionId
+        ? {
+            // A native compact recovery is delivered once per host session.
+            // Do not echo that same checkpoint back through the generic
+            // continuation brief on later events from this session.
+            excludeCompactionCheckpointFor: {
+              sessionId: input.sessionId,
+              agent: input.agent,
+            },
+          }
+        : {}),
+      enqueueRefresh: () => import('../runtime/lifecycle.js').then(({ enqueueCodegraphRefresh }) => {
+        enqueueCodegraphRefresh({
+          dataDir,
+          projectId: canonicalId,
+          source: target === 'hook-user-prompt' ? 'hook-user-prompt' : 'hook-session-start',
+          maxFiles: 5_000,
+        });
+      }),
+      deliveryTarget: target,
+    });
+
+    return {
+      prompt: formatAutoProjectContextPrompt(context),
+      hasContinuation: Boolean(
+        context.continuation?.previousSession || (context.continuation?.memories.length ?? 0) > 0,
+      ),
+    };
+  } catch (error) {
+    // A context hint must never interrupt the host's turn. The structured
+    // error is intentionally kept in stderr for hook diagnostics.
+    console.error('[memorix] hook context failed:', (error as Error)?.message ?? error);
+    return null;
+  }
+}
+
+function isCompactSessionStart(input: NormalizedHookInput): boolean {
+  return input.event === 'session_start'
+    && input.sessionStartReason?.trim().toLowerCase() === 'compact';
+}
+
+/**
+ * Consume one host-scoped checkpoint at a delivery point the host actually
+ * supports. This is intentionally best-effort: a local checkpoint failure
+ * must never interfere with the host's native compactor or current turn.
+ */
+async function consumeCompactContinuation(
+  input: NormalizedHookInput,
+  task: string,
+): Promise<string | undefined> {
+  try {
+    const { consumeCompactionWorkset } = await import('../memory/compaction.js');
+    const workset = await consumeCompactionWorkset(input, { task, maxTokens: 420 });
+    return workset?.text;
+  } catch (error) {
+    console.error('[memorix] compact continuation failed:', (error as Error)?.message ?? error);
+    return undefined;
+  }
+}
+
+/**
+ * Claude Code ignores SessionStart systemMessage as model context. Its official
+ * UserPromptSubmit output accepts additionalContext, so explicit continuation
+ * requests are delivered there instead of relying on a rules-file suggestion.
+ */
+async function buildClaudeContinuationPromptContext(input: NormalizedHookInput): Promise<string | undefined> {
+  if (input.agent !== 'claude' || input.event !== 'user_prompt' || !input.userPrompt?.trim()) {
+    return undefined;
+  }
+
+  if (await getHookInjectionMode(input) === 'silent') return undefined;
+
+  const compactContinuation = await consumeCompactContinuation(input, input.userPrompt);
+  if (compactContinuation) {
+    return [
+      'Memorix recovered one bounded checkpoint after the host compacted this session.',
+      'Treat it as background context; current code and the user request win.',
+      '',
+      compactContinuation,
+    ].join('\n');
+  }
+
+  const { isContinuationTask, resolveTaskLens } = await import('../codegraph/task-lens.js');
+  const continuationRequested = isContinuationTask(input.userPrompt);
+  if (continuationRequested) {
+    const context = await buildHookProjectContext(input, input.userPrompt, 'hook-user-prompt');
+    if (context?.hasContinuation) {
+      return [
+        'Memorix prepared a bounded prior-work brief for this explicit continuation request.',
+        'Treat it as background context; current code wins. Use it before broad Git or file-history archaeology.',
+        '',
+        context.prompt,
+      ].join('\n');
+    }
+  }
+
+  // Claude Code skills are user-invoked rather than automatically injected.
+  // For the narrow cases where prior project context is materially useful,
+  // provide a small routing nudge instead of silently adding a broad brief to
+  // every prompt. This keeps new feature work quiet while making handoffs and
+  // onboarding naturally discover the one-call Autopilot path.
+  if (continuationRequested || resolveTaskLens(input.userPrompt).id === 'onboarding') {
+    return [
+      'Memorix is available for this handoff or continuation.',
+      'Before broad file or Git exploration, call memorix_project_context with the user\'s actual task.',
+      'If it is not visible yet, use Claude Code tool search for memorix_project_context; use CLI only when MCP discovery is unavailable.',
+    ].join(' ');
+  }
+
+  return undefined;
+}
+
 async function handleSessionStart(input: NormalizedHookInput): Promise<{
   observation: ReturnType<typeof buildObservation> | null;
   output: HookOutput;
 }> {
-  // Check behavior config for session injection level
-  let injectMode: 'full' | 'minimal' | 'silent' = 'minimal';
-  try {
-    const { getBehaviorConfig } = await import('../config/behavior.js');
-    injectMode = getBehaviorConfig().sessionInject;
-  } catch { /* default to minimal */ }
+  const injectMode = await getHookInjectionMode(input);
 
   if (injectMode === 'silent') {
     return { observation: null, output: { continue: true } };
   }
 
-  let contextSummary = '';
-  try {
-    const { detectProject } = await import('../project/detector.js');
-    const { getProjectDataDir, loadObservationsJson } = await import('../store/persistence.js');
-    const { initAliasRegistry, registerAlias } = await import('../project/aliases.js');
-    const { calculateProjectAffinity, extractProjectKeywords } = await import('../store/project-affinity.js');
-
-    const rawProject = detectProject(input.cwd || process.cwd());
-    if (!rawProject) throw new Error('No .git found');
-    const dataDir = await getProjectDataDir(rawProject.id);
-    
-    // Resolve to canonical project ID (same as server.ts does)
-    initAliasRegistry(dataDir);
-    const canonicalId = await registerAlias(rawProject);
-    const allObs = await loadObservationsJson(dataDir) as Array<{
-      type?: string; title?: string; narrative?: string;
-      facts?: string[]; timestamp?: string; entityName?: string;
-      concepts?: string[]; filesModified?: string[];
-    }>;
-
-    if (allObs.length > 0) {
-      const PRIORITY_ORDER: Record<string, number> = {
-        'gotcha': 6, 'decision': 5, 'problem-solution': 4,
-        'trade-off': 3, 'discovery': 2, 'how-it-works': 1,
+  // Codex officially supports SessionStart additionalContext. Deliver the
+  // compact checkpoint there, before the generic startup brief can add noise.
+  if (input.agent === 'codex' && isCompactSessionStart(input)) {
+    const compactContinuation = await consumeCompactContinuation(
+      input,
+      'Continue after the host compacted the current session.',
+    );
+    if (compactContinuation) {
+      return {
+        observation: null,
+        output: {
+          continue: true,
+          systemMessage: [
+            'Memorix recovered one bounded checkpoint after the host compacted this session.',
+            'Treat it as background context; current code and the user request win.',
+            '',
+            compactContinuation,
+          ].join('\n'),
+        },
       };
-      const LOW_QUALITY_PATTERNS = [
-        /^Session activity/i,
-        /^Updated \S+\.\w+$/i,
-        /^Created \S+\.\w+$/i,
-        /^Deleted \S+\.\w+$/i,
-        /^Modified \S+\.\w+$/i,
-      ];
-      const isLowQuality = (title: string) =>
-        LOW_QUALITY_PATTERNS.some(p => p.test(title));
-
-      // Project Affinity context for filtering cross-project pollution
-      const affinityContext = {
-        projectName: rawProject.name,
-        projectId: canonicalId,
-        projectKeywords: extractProjectKeywords(rawProject.name, canonicalId),
-      };
-
-      const scored = allObs
-        .map((obs, i) => {
-          const title = obs.title ?? '';
-          const hasFacts = (obs.facts?.length ?? 0) > 0;
-          const hasSubstance = title.length > 20 || hasFacts;
-          const quality = isLowQuality(title) ? 0.1 : hasSubstance ? 1.0 : 0.5;
-          
-          // Apply Project Affinity scoring to filter cross-project memories
-          const { score: affinity } = calculateProjectAffinity({
-            title,
-            narrative: obs.narrative,
-            facts: obs.facts,
-            concepts: obs.concepts,
-            entityName: obs.entityName,
-            filesModified: obs.filesModified,
-          }, affinityContext);
-          
-          return { obs, priority: PRIORITY_ORDER[obs.type ?? ''] ?? 0, quality, affinity, recency: i };
-        })
-        // Filter out low-affinity memories (likely cross-project pollution)
-        .filter(item => item.affinity >= 0.5)
-        .sort((a, b) => {
-          const scoreA = a.priority * a.quality * a.affinity;
-          const scoreB = b.priority * b.quality * b.affinity;
-          if (scoreB !== scoreA) return scoreB - scoreA;
-          return b.recency - a.recency;
-        });
-
-      const top = scored.slice(0, 5);
-      const lines = top.map(({ obs }) => {
-        const emoji = TYPE_EMOJI[obs.type ?? ''] ?? '📌';
-        const title = obs.title ?? '(untitled)';
-        const fact = obs.facts?.[0] ? ` — ${obs.facts[0]}` : '';
-        return `${emoji} ${title}${fact}`;
-      });
-
-      contextSummary = `\n\nRecent project memories (${rawProject.name}):\n${lines.join('\n')}`;
     }
-  } catch {
-    // Silent fail — hooks must never break the agent
+  }
+
+  let contextSummary = '';
+  if (injectMode === 'full') {
+    const context = await buildHookProjectContext(input, 'Continue the current task.', 'hook-session-start');
+    if (context) contextSummary = `\n\n${context.prompt}`;
   }
 
   // Build system message based on inject mode
   let systemMessage: string;
   if (injectMode === 'full' && contextSummary) {
-    systemMessage = `Previous session context available. Use memorix_search if needed.${contextSummary}`;
+    systemMessage = `Previous session context may be available. Use memorix_search when prior project context would materially help. If search reports a fresh project with no Memorix memories yet, treat that as a cold-start signal and do not repeat the search in the same turn.${contextSummary}`;
   } else {
     // minimal: one-line hint, no memory content
-    systemMessage = 'Previous session context available. Use memorix_search if needed.';
+    systemMessage = 'Previous session context may be available. Use memorix_search when prior project context would materially help. If search reports a fresh project with no Memorix memories yet, do not repeat the search in the same turn.';
   }
 
   return {
@@ -372,11 +514,15 @@ async function handleSessionStart(input: NormalizedHookInput): Promise<{
  * Pipeline: Classify → Policy check → Store → Respond
  * Pattern detection is used for classification only, not storage gating.
  */
-export async function handleHookEvent(input: NormalizedHookInput): Promise<{
+async function handleHookEventCore(input: NormalizedHookInput): Promise<{
   observation: ReturnType<typeof buildObservation> | null;
   output: HookOutput;
 }> {
   const defaultOutput: HookOutput = { continue: true };
+  const continuationMessage = await buildClaudeContinuationPromptContext(input);
+  const output = continuationMessage
+    ? { ...defaultOutput, systemMessage: continuationMessage }
+    : defaultOutput;
 
   // ─── Session lifecycle (special handling) ───
   if (input.event === 'session_start') {
@@ -385,12 +531,26 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
   if (input.event === 'session_end') {
     const endContent = extractContent(input);
     if (endContent.length < 50) {
-      return { observation: null, output: defaultOutput };
+      return { observation: null, output };
     }
+    const draft = buildObservation(input, endContent, 'unknown');
+    const admission = assessHookAdmission({
+      hook: input,
+      category: 'unknown',
+      content: endContent,
+      observationType: draft.type,
+    });
     return {
-      observation: buildObservation(input, endContent, 'unknown'),
-      output: defaultOutput,
+      observation: admission.action === 'store'
+        ? buildObservation(input, endContent, 'unknown', admission)
+        : null,
+      output,
     };
+  }
+  if (input.event === 'post_compact') {
+    // Post-compaction: acknowledge the event, no observation needed.
+    // The real value is the side-effect (runHook pipe) already handled by the plugin.
+    return { observation: null, output };
   }
 
   // ─── Classify & extract ───
@@ -400,7 +560,7 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
 
   // Never-store category (memorix's own tools)
   if (policy.store === 'never') {
-    return { observation: null, output: defaultOutput };
+    return { observation: null, output };
   }
 
   // ─── Significance Filter (Cipher-style noise rejection) ───
@@ -408,19 +568,21 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
   if (category === 'command' && input.command) {
     const realCmd = extractRealCommand(input.command);
     if (isTrivialCommand(realCmd)) {
-      return { observation: null, output: defaultOutput };
+      return { observation: null, output };
     }
   }
 
   // Skip retrieved/search results (prevent memory pollution)
   if (isRetrievedResult(content)) {
-    return { observation: null, output: defaultOutput };
+    return { observation: null, output };
   }
 
   // Minimum length gate
-  const minLen = input.event === 'user_prompt' ? MIN_PROMPT_LENGTH : policy.minLength;
+  const minLen = (input.event === 'user_prompt' || input.event === 'post_response')
+    ? MIN_PROMPT_LENGTH
+    : policy.minLength;
   if (content.length < minLen) {
-    return { observation: null, output: defaultOutput };
+    return { observation: null, output };
   }
 
   // User prompts & AI responses are direct interaction — check significance
@@ -433,7 +595,7 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
   if (effectiveStore !== 'always') {
     const significance = isSignificantKnowledge(content);
     if (!significance.isSignificant) {
-      return { observation: null, output: defaultOutput };
+      return { observation: null, output };
     }
   }
 
@@ -442,21 +604,155 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
     const pattern = detectBestPattern(content);
     const significance = isSignificantKnowledge(content);
     if (!pattern && content.length < 200 && !significance.isSignificant) {
-      return { observation: null, output: defaultOutput };
+      return { observation: null, output };
     }
   }
 
   // Cooldown (per-file or per-command, not per-tool-category)
-  const cooldownKey = `${input.event}:${input.filePath ?? input.command ?? input.toolName ?? 'general'}`;
+  const cooldownKey = buildCooldownKey(input, content);
   if (isInCooldown(cooldownKey)) {
-    return { observation: null, output: defaultOutput };
+    return { observation: null, output };
   }
   markTriggered(cooldownKey);
 
+  const draft = buildObservation(input, content, category);
+  const admission = assessHookAdmission({
+    hook: input,
+    category,
+    content,
+    observationType: draft.type,
+  });
   return {
-    observation: buildObservation(input, content, category),
-    output: defaultOutput,
+    observation: admission.action === 'store'
+      ? buildObservation(input, content, category, admission)
+      : null,
+    output,
   };
+}
+
+/** Queue a later scan after an actual file mutation without scanning in the hook. */
+async function queueCodegraphRefreshForMutation(input: NormalizedHookInput): Promise<void> {
+  if (classifyTool(input) !== 'file_modify') return;
+  try {
+    const [
+      { detectProject },
+      { getProjectDataDir },
+      { initAliasRegistry, registerAlias },
+      { enqueueCodegraphRefresh },
+      { MaintenanceTargetStore },
+    ] = await Promise.all([
+      import('../project/detector.js'),
+      import('../store/persistence.js'),
+      import('../project/aliases.js'),
+      import('../runtime/lifecycle.js'),
+      import('../runtime/maintenance-targets.js'),
+    ]);
+    const project = detectProject(input.cwd || process.cwd());
+    if (!project) return;
+    const dataDir = await getProjectDataDir(project.id);
+    initAliasRegistry(dataDir);
+    const projectId = await registerAlias(project);
+    new MaintenanceTargetStore(dataDir).register({
+      projectId,
+      projectRoot: project.rootPath,
+      dataDir,
+    });
+    enqueueCodegraphRefresh({
+      dataDir,
+      projectId,
+      source: 'hook-file-mutation',
+      maxFiles: 5_000,
+    });
+  } catch {
+    // Hooks remain capture-first even if optional Code Memory scheduling fails.
+  }
+}
+
+export async function handleHookEvent(input: NormalizedHookInput): Promise<{
+  observation: ReturnType<typeof buildObservation> | null;
+  output: HookOutput;
+}>;
+export async function handleHookEvent(input: NormalizedHookInput, options: {
+  deferMaintenance?: boolean;
+}): Promise<{
+  observation: ReturnType<typeof buildObservation> | null;
+  output: HookOutput;
+}>;
+export async function handleHookEvent(input: NormalizedHookInput, options: {
+  deferMaintenance?: boolean;
+} = {}): Promise<{
+  observation: ReturnType<typeof buildObservation> | null;
+  output: HookOutput;
+}> {
+  try {
+    return await handleHookEventCore(input);
+  } finally {
+    // The CLI persists an automatic observation after this function returns.
+    // It defers scheduling so a fast worker never scans before that write.
+    if (!options.deferMaintenance) await queueCodegraphRefreshForMutation(input);
+  }
+}
+
+/**
+ * Convert Memorix's neutral hook response into the host-specific response
+ * schema expected by each supported agent.
+ */
+export function formatHookOutput(
+  agent: AgentName,
+  rawEventName: string,
+  output: HookOutput,
+): Record<string, unknown> {
+  if (agent === 'codex') {
+    const codexOutput: Record<string, unknown> = { continue: output.continue };
+    if (output.stopReason) codexOutput.stopReason = output.stopReason;
+
+    // Codex adds SessionStart additionalContext directly to developer context.
+    // Capture-only events deliberately stay quiet so automatic memory never
+    // becomes a stream of status messages in the agent's working context.
+    if (rawEventName === 'SessionStart' && output.systemMessage) {
+      codexOutput.hookSpecificOutput = {
+        hookEventName: 'SessionStart',
+        additionalContext: output.systemMessage,
+      };
+    }
+
+    return codexOutput;
+  }
+
+  if (agent === 'codebuddy' && rawEventName === 'SessionStart') {
+    return {
+      continue: output.continue,
+      ...(output.stopReason ? { reason: output.stopReason } : {}),
+      ...(output.systemMessage ? {
+        hookSpecificOutput: {
+          hookEventName: 'SessionStart',
+          additionalContext: output.systemMessage,
+        },
+      } : {}),
+    };
+  }
+
+  const finalOutput: Record<string, unknown> = { ...output };
+  const hookSpecificOutputEvents = new Set([
+    'PreToolUse',
+    'UserPromptSubmit',
+    'PostToolUse',
+    'postToolUse',
+    'preToolUse',
+    'userPromptSubmitted',
+  ]);
+
+  if (rawEventName && hookSpecificOutputEvents.has(rawEventName)) {
+    const hookSpecificOutput: Record<string, unknown> = { hookEventName: rawEventName };
+    if (output.systemMessage) {
+      hookSpecificOutput.additionalContext = output.systemMessage;
+    } else if (rawEventName === 'UserPromptSubmit') {
+      hookSpecificOutput.additionalContext = '';
+    }
+    finalOutput.hookSpecificOutput = hookSpecificOutput;
+  }
+
+  return finalOutput;
 }
 
 // ─── Entry Point ───
@@ -465,7 +761,7 @@ export async function handleHookEvent(input: NormalizedHookInput): Promise<{
  * Main entry point: read stdin, process, write stdout.
  * Called by the CLI: `memorix hook`
  */
-export async function runHook(): Promise<void> {
+export async function runHook(agentOverride?: string, eventOverride?: string): Promise<void> {
   // Read stdin with a timeout — some hosts (e.g. Gemini CLI) may not close
   // stdin promptly, causing `for await` to hang until the process is killed.
   const rawInput = await new Promise<string>((resolve) => {
@@ -497,15 +793,36 @@ export async function runHook(): Promise<void> {
     return;
   }
 
+  // Inject agent identity from CLI --agent flag into the payload
+  // so the normalizer can reliably identify the source agent.
+  if (agentOverride) {
+    payload._memorix_agent = agentOverride;
+  }
+  if (eventOverride) {
+    payload._memorix_event = eventOverride;
+  }
+
   const input = normalizeHookInput(payload);
-  const { observation, output } = await handleHookEvent(input);
+  try {
+    const { captureCompactionCheckpoint } = await import('../memory/compaction.js');
+    await captureCompactionCheckpoint(input);
+  } catch (checkpointError) {
+    // Host-native compaction is authoritative. Checkpoint persistence is an
+    // additive recovery layer and must never block it.
+    console.error('[memorix] compact checkpoint failed:', (checkpointError as Error)?.message ?? checkpointError);
+  }
+  const { observation, output } = await handleHookEvent(input, { deferMaintenance: true });
 
   if (observation) {
     try {
       const { storeObservation, initObservations } = await import('../memory/observations.js');
+      const { initObservationStore } = await import('../store/obs-store.js');
+      const { initMiniSkillStore: initMSStore } = await import('../store/mini-skill-store.js');
+      const { initSessionStore: initSessStore } = await import('../store/session-store.js');
       const { detectProject } = await import('../project/detector.js');
       const { getProjectDataDir } = await import('../store/persistence.js');
       const { initAliasRegistry, registerAlias } = await import('../project/aliases.js');
+      const { MaintenanceTargetStore } = await import('../runtime/maintenance-targets.js');
 
       const rawProject = detectProject(input.cwd || process.cwd());
       if (!rawProject) throw new Error('No .git found');
@@ -515,108 +832,69 @@ export async function runHook(): Promise<void> {
       initAliasRegistry(dataDir);
       const canonicalId = await registerAlias(rawProject);
       const projectId = canonicalId;
+      new MaintenanceTargetStore(dataDir).register({
+        projectId,
+        projectRoot: rawProject.rootPath,
+        dataDir,
+      });
       
+      await initObservationStore(dataDir);
+      await initMSStore(dataDir);
+      await initSessStore(dataDir);
       await initObservations(dataDir);
-      await storeObservation({ ...observation, projectId });
-
-      // Shadow mode: Formation Pipeline metrics (fire-and-forget, never blocks)
-      try {
-        const { runFormation } = await import('../memory/formation/index.js');
-        const formationMode = (process.env.MEMORIX_FORMATION_MODE as 'shadow' | 'active' | 'fallback') || 'shadow';
-        const samplingRate = parseFloat(process.env.MEMORIX_FORMATION_HOOKS_SAMPLING_RATE || '0.1');
-        const shouldSample = Math.random() < samplingRate;
-
-        // In hooks, shadow mode by default for performance
-        // Sampling rate controls how often we run full resolve (expensive)
-        const searchFn = shouldSample
-          ? async (q: string, limit: number, pid: string) => {
-              const { compactSearch, compactDetail } = await import('../compact/engine.js');
-              const result = await compactSearch({ query: q, limit, projectId: pid, status: 'active' });
-              if (result.entries.length === 0) return [];
-              const details = await compactDetail(result.entries.map(e => e.id));
-              return details.documents.map((d, i) => ({
-                id: Number(d.id.replace('obs-', '')),
-                observationId: d.observationId,
-                title: d.title,
-                narrative: d.narrative,
-                facts: d.facts,
-                entityName: d.entityName,
-                type: d.type,
-                score: result.entries[i]?.score ?? 0,
-              }));
-            }
-          : async () => []; // Skip search for speed (shadow mode)
-
-        const getObsFn = shouldSample
-          ? (id: number) => {
-              const { getObservation } = require('../memory/observations.js');
-              const o = getObservation(id);
-              if (!o) return null;
-              return {
-                id: o.id,
-                entityName: o.entityName,
-                type: o.type,
-                title: o.title,
-                narrative: o.narrative,
-                facts: o.facts,
-                topicKey: o.topicKey,
-              };
-            }
-          : () => null;
-
-        const getEntityNamesFn = shouldSample
-          ? () => {
-              const { graphManager } = require('../memory/graph.js');
-              return graphManager.getEntityNames();
-            }
-          : () => [];
-
-        runFormation({
-          entityName: observation.entityName,
-          type: observation.type,
-          title: observation.title,
-          narrative: observation.narrative,
-          facts: observation.facts,
-          projectId,
-          source: 'hook' as const,
-        }, {
-          mode: formationMode,
-          useLLM: false,
-          minValueScore: 0.3,
-          hooksSamplingRate: samplingRate,
-          searchMemories: searchFn,
-          getObservation: getObsFn,
-          getEntityNames: getEntityNamesFn,
-        }).catch(() => {});
-      } catch { /* Formation is optional — never break hooks */ }
-
-      // Feedback: tell the agent what was saved
-      const emoji = TYPE_EMOJI[observation.type] ?? '📝';
-      output.systemMessage = (output.systemMessage ?? '') +
-        `\n${emoji} Memorix saved: ${observation.title} [${observation.type}]`;
-    } catch {
-      // Silent fail — hooks must never break the agent
+      await storeObservation({ ...observation, projectId, sourceDetail: 'hook' });
+      // Automatic capture is deliberately quiet. Candidate state and later
+      // qualification are visible through Memorix inspection, not injected as
+      // a stream of status messages into the host agent's context.
+    } catch (storeErr) {
+      // Diagnostic log — hooks must never break the agent, but silent
+      // swallow makes end-to-end debugging impossible.
+      console.error('[memorix] hook store failed:', (storeErr as Error)?.message ?? storeErr);
     }
   }
+
+  // A candidate must be durable before a Code Memory refresh can qualify it.
+  // Keep direct handleHookEvent() backward-compatible, but make the real CLI
+  // hook path explicitly capture first and schedule second.
+  await queueCodegraphRefreshForMutation(input);
 
   // Build hookSpecificOutput — Claude Code only supports it for 3 event types:
   //   PreToolUse, UserPromptSubmit, PostToolUse
   // Other events (SessionStart, Stop, PreCompact) must NOT include hookSpecificOutput.
   // Claude Code sends hook_event_name (snake_case), Copilot sends hookEventName (camelCase)
-  const rawEventName = (payload.hook_event_name as string)
+  const rawEventName = (payload._memorix_event as string)
+    ?? (payload.hook_event_name as string)
     ?? (payload.hookEventName as string)
     ?? '';
-  const finalOutput: Record<string, unknown> = { ...output };
-  const HSO_EVENTS = new Set(['PreToolUse', 'UserPromptSubmit', 'PostToolUse', 'postToolUse', 'preToolUse', 'userPromptSubmitted']);
-  if (rawEventName && HSO_EVENTS.has(rawEventName)) {
-    const hso: Record<string, unknown> = { hookEventName: rawEventName };
-    // additionalContext is REQUIRED for UserPromptSubmit, optional for others
-    if (output.systemMessage) {
-      hso.additionalContext = output.systemMessage;
-    } else if (rawEventName === 'UserPromptSubmit') {
-      hso.additionalContext = '';
-    }
-    finalOutput.hookSpecificOutput = hso;
+  if (input.agent === 'antigravity') {
+    process.stdout.write(JSON.stringify(toAntigravityHookOutput(rawEventName, output)));
+    return;
   }
+  const finalOutput = formatHookOutput(input.agent, rawEventName, output);
   process.stdout.write(JSON.stringify(finalOutput));
+}
+
+function toAntigravityHookOutput(rawEventName: string, output: HookOutput): Record<string, unknown> {
+  switch (rawEventName) {
+    case 'PreToolUse':
+      return {
+        decision: output.continue === false ? 'deny' : 'allow',
+        ...(output.stopReason ? { reason: output.stopReason } : {}),
+      };
+    case 'PostToolUse':
+      return {};
+    case 'PreInvocation':
+      return output.systemMessage
+        ? { injectSteps: [{ ephemeralMessage: output.systemMessage }] }
+        : { injectSteps: [] };
+    case 'PostInvocation':
+      return {
+        injectSteps: output.systemMessage ? [{ ephemeralMessage: output.systemMessage }] : [],
+        terminationBehavior: output.continue === false ? 'terminate' : '',
+      };
+    case 'Stop':
+      return { decision: '' };
+    default:
+      return {};
+  }
 }

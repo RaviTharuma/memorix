@@ -25,11 +25,13 @@ const TYPE_WEIGHTS: Record<ObservationType, number> = {
   'decision':         0.80,
   'problem-solution': 0.75,
   'trade-off':        0.70,
+  'reasoning':        0.70,
   'why-it-exists':    0.65,
   'how-it-works':     0.60,
   'discovery':        0.55,
   'what-changed':     0.45,
   'session-request':  0.40,
+  'probe':            0.10,
 };
 
 /** Patterns indicating high-specificity content (boost value) */

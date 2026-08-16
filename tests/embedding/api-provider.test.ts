@@ -6,10 +6,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
 
 // Mock fetch globally
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
+
+const mockDiskFiles = new Map<string, string>();
+let cacheMetadataPayload: string | undefined;
 
 // Mock Headers for consistent behavior
 function mockHeaders(entries: [string, string][] = []): { get: (key: string) => string | null } {
@@ -19,12 +23,18 @@ function mockHeaders(entries: [string, string][] = []): { get: (key: string) => 
 
 // Mock fs for disk cache
 vi.mock('node:fs/promises', () => ({
-  readFile: vi.fn().mockRejectedValue(new Error('no cache')),
-  writeFile: vi.fn().mockResolvedValue(undefined),
+  readFile: vi.fn(async (path: string) => {
+    if (cacheMetadataPayload && path.endsWith('.embedding-api-cache-meta.json')) return cacheMetadataPayload;
+    if (!mockDiskFiles.has(path)) throw new Error('no cache');
+    return mockDiskFiles.get(path);
+  }),
+  writeFile: vi.fn(async (path: string, content: string) => {
+    mockDiskFiles.set(path, content);
+  }),
   mkdir: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { APIEmbeddingProvider } from '../../src/embedding/api-provider.js';
+import { APIEmbeddingProvider } from '../../src/embedding/api-provider.ts';
 
 // Helper: create a mock embedding response
 function mockEmbeddingResponse(embeddings: number[][], model = 'text-embedding-3-small') {
@@ -59,6 +69,8 @@ describe('API Embedding Provider', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     vi.stubGlobal('fetch', mockFetch);
+    mockDiskFiles.clear();
+    cacheMetadataPayload = undefined;
     process.env = {
       ...originalEnv,
       MEMORIX_EMBEDDING: 'api',
@@ -66,9 +78,14 @@ describe('API Embedding Provider', () => {
       MEMORIX_EMBEDDING_BASE_URL: 'https://api.test.com/v1',
       MEMORIX_EMBEDDING_MODEL: 'text-embedding-3-small',
     };
-    // Remove dimension override and unified key by default
+    // Remove dimension override and non-embedding lane keys by default
     delete process.env.MEMORIX_EMBEDDING_DIMENSIONS;
     delete process.env.MEMORIX_API_KEY;
+    delete process.env.MEMORIX_LLM_API_KEY;
+    delete process.env.MEMORIX_LLM_BASE_URL;
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.DASHSCOPE_API_KEY;
+    delete process.env.ALIYUN_API_KEY;
   });
 
   afterEach(() => {
@@ -76,6 +93,29 @@ describe('API Embedding Provider', () => {
   });
 
   describe('initialization', () => {
+    it('does not probe remotely when cache-only initialization has no cached dimensions', async () => {
+      const provider = await APIEmbeddingProvider.create({ allowNetworkProbe: false });
+
+      expect(provider).toBeNull();
+      expect(mockFetch).not.toHaveBeenCalled();
+      const readPaths = vi.mocked(readFile).mock.calls.map(([path]) => String(path));
+      expect(readPaths.some((path) => path.endsWith('.embedding-api-cache.json'))).toBe(false);
+    });
+
+    it('restores cache-only dimensions from matching vector-cache metadata when dims metadata is missing', async () => {
+      const namespace = 'v2|https://api.test.com/v1|text-embedding-3-small|native';
+      cacheMetadataPayload = JSON.stringify({
+        version: 1,
+        entries: [{ namespace, dimensions: 3, ts: Date.now() }],
+      });
+
+      const provider = await APIEmbeddingProvider.create({ allowNetworkProbe: false });
+
+      expect(provider).not.toBeNull();
+      expect(provider?.dimensions).toBe(3);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it('should probe API and detect dimensions', async () => {
       const vec1536 = makeVector(1536);
       mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([vec1536]));
@@ -106,31 +146,42 @@ describe('API Embedding Provider', () => {
       expect(body.dimensions).toBe(512);
     });
 
-    it('should fall back to LLM API key if embedding key not set', async () => {
+    it('should not reuse cached probe dimensions across requested dimension changes', async () => {
+      process.env.MEMORIX_EMBEDDING_DIMENSIONS = '512';
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([makeVector(512)]));
+
+      const shortenedProvider = await APIEmbeddingProvider.create();
+      expect(shortenedProvider.dimensions).toBe(512);
+
+      delete process.env.MEMORIX_EMBEDDING_DIMENSIONS;
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([makeVector(1536)]));
+
+      const nativeProvider = await APIEmbeddingProvider.create();
+
+      expect(nativeProvider.dimensions).toBe(1536);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('should not fall back to memory LLM API key when embedding key is not set', async () => {
       delete process.env.MEMORIX_EMBEDDING_API_KEY;
       process.env.MEMORIX_LLM_API_KEY = 'llm-key-456';
 
-      const vec384 = makeVector(384);
-      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([vec384]));
-
-      const provider = await APIEmbeddingProvider.create();
-
-      const [, options] = mockFetch.mock.calls[0];
-      expect(options.headers['Authorization']).toBe('Bearer llm-key-456');
+      await expect(APIEmbeddingProvider.create()).rejects.toThrow('No API key');
     });
 
-    it('should fall back to OPENAI_API_KEY', async () => {
+    it('should not fall back to memory LLM MEMORIX_API_KEY when embedding key is not set', async () => {
+      delete process.env.MEMORIX_EMBEDDING_API_KEY;
+      process.env.MEMORIX_API_KEY = 'legacy-unified-key';
+
+      await expect(APIEmbeddingProvider.create()).rejects.toThrow('No API key');
+    });
+
+    it('should not fall back to provider OPENAI_API_KEY when embedding key is not set', async () => {
       delete process.env.MEMORIX_EMBEDDING_API_KEY;
       delete process.env.MEMORIX_LLM_API_KEY;
       process.env.OPENAI_API_KEY = 'openai-key-789';
 
-      const vec1536 = makeVector(1536);
-      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([vec1536]));
-
-      const provider = await APIEmbeddingProvider.create();
-
-      const [, options] = mockFetch.mock.calls[0];
-      expect(options.headers['Authorization']).toBe('Bearer openai-key-789');
+      await expect(APIEmbeddingProvider.create()).rejects.toThrow('No API key');
     });
 
     it('should throw if no API key available', async () => {
@@ -184,6 +235,31 @@ describe('API Embedding Provider', () => {
       // Second call should not trigger a new fetch
       expect(mockFetch).toHaveBeenCalledTimes(2); // probe + 1 embed only
       expect(result1).toEqual(result2);
+    });
+
+    it('should namespace cache entries by model config to avoid stale dimension reuse', async () => {
+      const smallVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([smallVec]));
+      const smallProvider = await APIEmbeddingProvider.create();
+
+      const cachedSmallEmbed = makeVector(1536, 0.5);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([cachedSmallEmbed]));
+      const firstResult = await smallProvider.embed('shared-text');
+      expect(firstResult.length).toBe(1536);
+
+      process.env.MEMORIX_EMBEDDING_MODEL = 'text-embedding-3-large';
+      const largeProbe = makeVector(3072, 0.2);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([largeProbe], 'text-embedding-3-large'));
+      const largeProvider = await APIEmbeddingProvider.create();
+
+      const largeEmbed = makeVector(3072, 0.7);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([largeEmbed], 'text-embedding-3-large'));
+
+      const secondResult = await largeProvider.embed('shared-text');
+
+      expect(secondResult).toEqual(largeEmbed);
+      expect(secondResult.length).toBe(3072);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
     });
   });
 
@@ -246,9 +322,100 @@ describe('API Embedding Provider', () => {
       expect(results).toHaveLength(2);
       expect(mockFetch).toHaveBeenCalledTimes(callCount); // No new calls
     });
+
+    it('should respect DashScope batch size limits', async () => {
+      process.env.MEMORIX_EMBEDDING_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+      process.env.MEMORIX_EMBEDDING_MODEL = 'text-embedding-v4';
+
+      const probeVec = makeVector(1024);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec], 'text-embedding-v4'));
+      const provider = await APIEmbeddingProvider.create();
+
+      const inputs = Array.from({ length: 12 }, (_, i) => `dashscope-batch-${i}`);
+      const chunk1 = Array.from({ length: 10 }, (_, i) => makeVector(1024, 0.01 * (i + 1)));
+      const chunk2 = Array.from({ length: 2 }, (_, i) => makeVector(1024, 0.2 + 0.01 * i));
+
+      mockFetch
+        .mockResolvedValueOnce(mockEmbeddingResponse(chunk1, 'text-embedding-v4'))
+        .mockResolvedValueOnce(mockEmbeddingResponse(chunk2, 'text-embedding-v4'));
+
+      const results = await provider.embedBatch(inputs);
+
+      expect(results).toHaveLength(12);
+      expect(results[0]).toEqual(chunk1[0]);
+      expect(results[9]).toEqual(chunk1[9]);
+      expect(results[10]).toEqual(chunk2[0]);
+      expect(results[11]).toEqual(chunk2[1]);
+
+      const firstBatchBody = JSON.parse(mockFetch.mock.calls[1][1].body);
+      const secondBatchBody = JSON.parse(mockFetch.mock.calls[2][1].body);
+      expect(firstBatchBody.input).toHaveLength(10);
+      expect(secondBatchBody.input).toHaveLength(2);
+    });
+
+    it('should split and retry when provider rejects an oversized batch', async () => {
+      const probeVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
+      const provider = await APIEmbeddingProvider.create();
+
+      const oversizeError = {
+        ok: false,
+        status: 400,
+        headers: mockHeaders(),
+        text: () => Promise.resolve('batch size is invalid, it should not be larger than 2'),
+      };
+
+      mockFetch
+        .mockResolvedValueOnce(oversizeError)
+        .mockResolvedValueOnce(mockEmbeddingResponse([makeVector(1536, 0.11), makeVector(1536, 0.12)]))
+        .mockResolvedValueOnce(mockEmbeddingResponse([makeVector(1536, 0.21), makeVector(1536, 0.22)]));
+
+      const results = await provider.embedBatch(['split-a', 'split-b', 'split-c', 'split-d']);
+
+      expect(results).toHaveLength(4);
+      expect(results.every((item) => Array.isArray(item) && item.length === 1536)).toBe(true);
+
+      const firstRetryBody = JSON.parse(mockFetch.mock.calls[2][1].body);
+      const secondRetryBody = JSON.parse(mockFetch.mock.calls[3][1].body);
+      expect(firstRetryBody.input).toEqual(['split-a', 'split-b']);
+      expect(secondRetryBody.input).toEqual(['split-c', 'split-d']);
+    });
+
+    it('does not split a billing error even when its message mentions batch size', async () => {
+      const probeVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
+      const provider = await APIEmbeddingProvider.create();
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 402,
+        headers: mockHeaders(),
+        text: () => Promise.resolve('subscription rejected; batch size was not processed'),
+      });
+
+      await expect(provider.embedBatch(['billing-a', 'billing-b', 'billing-c']))
+        .rejects.toThrow('402');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('error handling & retry', () => {
+    it('allows a bounded caller to disable API retries', async () => {
+      const probeVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
+      const provider = await APIEmbeddingProvider.create();
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: mockHeaders([['retry-after', '0']]),
+        text: () => Promise.resolve('rate limited'),
+      });
+
+      await expect(provider.embed('no-retry test', { timeoutMs: 100, retry: false })).rejects.toThrow('429');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
     it('should retry on 429 rate limit', async () => {
       const probeVec = makeVector(1536);
       mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
@@ -302,6 +469,46 @@ describe('API Embedding Provider', () => {
       });
 
       await expect(provider.embed('auth fail')).rejects.toThrow('401');
+    });
+
+    it('applies the request timeout while reading a response body', async () => {
+      const probeVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
+      const provider = await APIEmbeddingProvider.create();
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: mockHeaders(),
+        json: () => new Promise(() => {}),
+      });
+
+      await expect(provider.embed('body timeout', { timeoutMs: 100, retry: false }))
+        .rejects.toThrow(/Embedding API timeout after 100ms/);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('aborts response parsing when the caller signal is cancelled', async () => {
+      const probeVec = makeVector(1536);
+      mockFetch.mockResolvedValueOnce(mockEmbeddingResponse([probeVec]));
+      const provider = await APIEmbeddingProvider.create();
+      const controller = new AbortController();
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: mockHeaders(),
+        json: () => new Promise(() => {}),
+      });
+
+      const pending = provider.embed('caller abort', {
+        timeoutMs: 500,
+        retry: false,
+        signal: controller.signal,
+      });
+      controller.abort();
+
+      await expect(pending).rejects.toThrow(/Embedding API timeout after 500ms/);
     });
 
     it('should detect dimension mismatch', async () => {

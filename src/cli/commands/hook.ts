@@ -15,8 +15,20 @@ export default defineCommand({
     name: 'hook',
     description: 'Handle agent hook event (called by agent hook configs)',
   },
-  run: async () => {
+  args: {
+    agent: {
+      type: 'string',
+      description: 'Source agent identifier (e.g. gemini-cli). Injected by generated hook configs for reliable agent detection.',
+      required: false,
+    },
+    event: {
+      type: 'string',
+      description: 'Source hook event name when the host does not include it in stdin.',
+      required: false,
+    },
+  },
+  run: async ({ args }) => {
     const { runHook } = await import('../../hooks/handler.js');
-    await runHook();
+    await runHook(args.agent as string | undefined, args.event as string | undefined);
   },
 });

@@ -5,595 +5,123 @@
  * Built with: citty (1.1K stars, zero-deps) + @clack/prompts (7.4K stars)
  *
  * Commands:
- *   memorix         — Interactive TUI menu (no args)
+ *   memorix         — Enter memcode TUI (native coding agent)
+ *   memorix memcode — Enter memcode TUI (explicit)
+ *   memorix ask "q" — Single-shot chat question (pipe: echo "q" | memorix ask)
  *   memorix serve   — Start MCP Server on stdio
  *   memorix status  — Show project info + rules sync status
  *   memorix sync    — Interactive cross-agent rule sync
  */
 
 import { defineCommand, runMain } from 'citty';
-import { createRequire } from 'node:module';
 import * as p from '@clack/prompts';
-import { execSync, spawn } from 'node:child_process';
+import { getCliVersion } from './version.js';
+import { importBundledMemcode } from './memcode-bootstrap.js';
+import { installCliPipeErrorGuard } from './pipe-errors.js';
+import { normalizeCliInvocation } from './invocation.js';
+import { printCliGuideForHelp, renderCliGuide } from './command-guide.js';
 
-const require = createRequire(import.meta.url);
-const pkg = require('../../package.json') as { version: string };
+installCliPipeErrorGuard();
 
-// ============================================================
-// Interactive TUI Menu
-// ============================================================
+const NO_GIT_MSG = 'Memorix requires a git repo to establish project identity. Run `git init` in this workspace first.';
 
-async function interactiveMenu(): Promise<void> {
-  p.intro(`Memorix v${pkg.version}`);
-
-  // Loop until user exits or chooses a blocking action
-  while (true) {
-    const action = await p.select({
-      message: 'What would you like to do?',
-      options: [
-        { value: 'search', label: 'Search memories', hint: 'find by keyword' },
-        { value: 'list', label: 'View recent', hint: 'latest observations' },
-        { value: 'dashboard', label: 'Open Dashboard', hint: 'localhost:3210' },
-        { value: 'hooks', label: 'Install hooks', hint: 'auto-capture for IDEs' },
-        { value: 'status', label: 'Project status', hint: 'info + stats' },
-        { value: 'cleanup', label: 'Clean up', hint: 'remove old memories' },
-        { value: 'ingest', label: 'Ingest from Git', hint: 'commit → memory' },
-        { value: 'audit', label: 'Audit trail', hint: 'Memorix-written files' },
-        { value: 'sync', label: 'Sync rules', hint: 'cross-agent sync' },
-        { value: 'init', label: 'Init memorix.yml', hint: 'generate config file' },
-        { value: 'configure', label: 'Configure', hint: 'LLM + embedding settings' },
-        { value: 'serve', label: 'Start MCP server', hint: 'for IDE integration' },
-        { value: 'exit', label: 'Exit', hint: 'quit memorix' },
-      ],
-    });
-
-    if (p.isCancel(action) || action === 'exit') {
-      p.outro('Goodbye!');
-      process.exit(0);
-    }
-
-    switch (action) {
-      case 'search': {
-        const query = await p.text({
-          message: 'Enter search query:',
-          placeholder: 'e.g., authentication bug fix',
-        });
-        if (p.isCancel(query) || !query) {
-          continue; // Back to menu
-        }
-        await runSearch(query);
-        break;
-      }
-      case 'list':
-        await runList();
-        break;
-      case 'dashboard':
-        await runCommand('dashboard');
-        return; // Dashboard is blocking, exit after
-      case 'hooks':
-        await runHooksMenu();
-        break;
-      case 'status':
-        await runCommand('status');
-        break;
-      case 'cleanup':
-        await runCleanupMenu();
-        break;
-      case 'ingest':
-        await runIngestMenu();
-        break;
-      case 'audit':
-        await runAuditList();
-        break;
-      case 'sync':
-        await runCommand('sync');
-        break;
-      case 'init': {
-        const m = await import('./commands/init.js');
-        await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-        break;
-      }
-      case 'configure':
-        await runConfigure();
-        break;
-      case 'serve':
-        p.log.info('Starting MCP server on stdio...');
-        await runCommand('serve');
-        return; // Serve is blocking, exit after
-    }
-    
-    console.log(''); // Add spacing before next menu
-  }
-}
-
-async function runHooksMenu(): Promise<void> {
-  const action = await p.select({
-    message: 'Hooks management:',
-    options: [
-      { value: 'install', label: 'Install hooks', hint: 'set up auto-capture' },
-      { value: 'preview', label: 'Preview installation', hint: 'show files to be created' },
-      { value: 'uninstall', label: 'Uninstall hooks', hint: 'remove from all agents' },
-      { value: 'status', label: 'Status', hint: 'show installed hooks' },
-      { value: 'back', label: '← Back', hint: 'return to main menu' },
-    ],
-  });
-
-  if (p.isCancel(action) || action === 'back') return;
-
-  switch (action) {
-    case 'install': {
-      const m = await import('./commands/hooks-install.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'preview': {
-      const m = await import('./commands/hooks-preview.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'uninstall': {
-      const m = await import('./commands/hooks-uninstall.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'status': {
-      const m = await import('./commands/hooks-status.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-  }
-}
-
-async function runCleanupMenu(): Promise<void> {
-  const action = await p.select({
-    message: 'Cleanup options:',
-    options: [
-      { value: 'project-artifacts', label: 'Uninstall project artifacts', hint: 'remove hook files only' },
-      { value: 'project-memory', label: 'Purge project memory', hint: 'delete current project memories' },
-      { value: 'all-memory', label: 'Purge all memory', hint: '⚠️ delete ALL memories' },
-      { value: 'back', label: '← Back', hint: 'return to main menu' },
-    ],
-  });
-
-  if (p.isCancel(action) || action === 'back') return;
-
-  switch (action) {
-    case 'project-artifacts': {
-      const m = await import('./commands/uninstall-project-artifacts.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'project-memory': {
-      const m = await import('./commands/purge-project-memory.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'all-memory': {
-      const m = await import('./commands/purge-all-memory.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-  }
-}
-
-async function runIngestMenu(): Promise<void> {
-  const action = await p.select({
-    message: 'Git → Memory:',
-    options: [
-      { value: 'commit', label: 'Ingest commit', hint: 'single commit → memory' },
-      { value: 'log', label: 'Ingest log', hint: 'batch recent commits → memories' },
-      { value: 'git-hook', label: 'Install git hook', hint: 'auto-capture on every commit' },
-      { value: 'git-hook-uninstall', label: 'Uninstall git hook', hint: 'remove auto-capture' },
-      { value: 'back', label: '← Back', hint: 'return to main menu' },
-    ],
-  });
-
-  if (p.isCancel(action) || action === 'back') return;
-
-  switch (action) {
-    case 'commit': {
-      const m = await import('./commands/ingest-commit.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'log': {
-      const m = await import('./commands/ingest-log.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'git-hook': {
-      const m = await import('./commands/git-hook-install.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'git-hook-uninstall': {
-      const m = await import('./commands/git-hook-uninstall.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-  }
-}
-
-async function runAuditList(): Promise<void> {
-  const m = await import('./commands/audit-list.js');
-  await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-}
-
-async function runConfigure(): Promise<void> {
-  const configPath = `${process.env.HOME || process.env.USERPROFILE}/.memorix/config.json`;
-
-  // Helper: load config from disk
-  const loadConfig = async () => {
-    try {
-      const fs = await import('node:fs');
-      if (fs.existsSync(configPath)) {
-        return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      }
-    } catch { /* ignore */ }
-    return {};
-  };
-
-  // Helper: save config to disk
-  const saveConfig = async (config: Record<string, unknown>) => {
-    const fs = await import('node:fs');
-    const dir = `${process.env.HOME || process.env.USERPROFILE}/.memorix`;
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  };
-
-  // Loop: configure multiple things without going back to main menu
-  while (true) {
-    const config = await loadConfig();
-
-    const section = await p.select({
-      message: 'What would you like to configure?',
-      options: [
-        { value: 'llm', label: 'LLM Enhanced Mode', hint: 'smart dedup + fact extraction' },
-        { value: 'embedding', label: 'Embedding Provider', hint: 'semantic search' },
-        { value: 'behavior', label: 'Behavior Settings', hint: 'session inject, auto-cleanup, sync advisory' },
-        { value: 'show', label: 'Show current config', hint: 'view settings' },
-        { value: 'back', label: '\u2190 Back', hint: 'return to main menu' },
-      ],
-    });
-
-    if (p.isCancel(section) || section === 'back') return;
-
-    if (section === 'show') {
-      console.log('\nCurrent configuration:');
-      console.log(`  Config file: ${configPath}`);
-      console.log(`  LLM Provider: ${config.llm?.provider ?? 'not configured'}`);
-      console.log(`  LLM Model: ${config.llm?.model ?? 'default'}`);
-      console.log(`  LLM Base URL: ${config.llm?.baseUrl ?? '(default)'}`);
-      console.log(`  LLM API Key: ${config.llm?.apiKey ? '***configured***' : 'not set'}`);
-      console.log(`  Embedding: ${config.embedding ?? 'off (BM25 only)'}`);
-      if (config.embedding === 'api') {
-        const apiConf = config.embeddingApi;
-        if (apiConf) {
-          console.log(`  Embedding Model: ${apiConf.model ?? 'text-embedding-3-small'}`);
-          console.log(`  Embedding Base URL: ${apiConf.baseUrl ?? '(default)'}`);
-          console.log(`  Embedding API Key: ${apiConf.apiKey ? '***configured***' : '(reusing LLM key)'}`);
-          if (apiConf.dimensions) console.log(`  Embedding Dimensions: ${apiConf.dimensions}`);
-        }
-      }
-      console.log('\nEnvironment overrides (take priority over config.json):');
-      console.log(`  MEMORIX_LLM_API_KEY: ${process.env.MEMORIX_LLM_API_KEY ? '***set***' : 'not set'}`);
-      console.log(`  OPENAI_API_KEY: ${process.env.OPENAI_API_KEY ? '***set***' : 'not set'}`);
-      console.log(`  MEMORIX_EMBEDDING: ${process.env.MEMORIX_EMBEDDING ?? 'not set'}`);
-      if (process.env.MEMORIX_EMBEDDING === 'api') {
-        console.log(`  MEMORIX_EMBEDDING_API_KEY: ${process.env.MEMORIX_EMBEDDING_API_KEY ? '***set***' : 'not set'}`);
-        console.log(`  MEMORIX_EMBEDDING_BASE_URL: ${process.env.MEMORIX_EMBEDDING_BASE_URL ?? 'not set'}`);
-        console.log(`  MEMORIX_EMBEDDING_MODEL: ${process.env.MEMORIX_EMBEDDING_MODEL ?? 'text-embedding-3-small'}`);
-        console.log(`  MEMORIX_EMBEDDING_DIMENSIONS: ${process.env.MEMORIX_EMBEDDING_DIMENSIONS ?? 'auto'}`);
-      }
-      console.log('');
-      continue; // Back to configure menu
-    }
-
-    if (section === 'llm') {
-      const provider = await p.select({
-        message: 'Select LLM provider:',
-        options: [
-          { value: 'openai', label: 'OpenAI', hint: 'gpt-4o-mini recommended' },
-          { value: 'anthropic', label: 'Anthropic', hint: 'claude-3-haiku' },
-          { value: 'openrouter', label: 'OpenRouter', hint: 'multi-provider' },
-          { value: 'custom', label: 'Custom endpoint', hint: 'OpenAI-compatible proxy / local' },
-          { value: 'disable', label: 'Disable LLM', hint: 'use free heuristic mode' },
-        ],
-      });
-
-      if (p.isCancel(provider)) continue; // Back to configure menu
-
-      if (provider === 'disable') {
-        config.llm = undefined;
-        await saveConfig(config);
-        p.log.success('LLM mode disabled. Using free heuristic deduplication.');
-        continue;
-      }
-
-      const apiKey = await p.password({
-        message: 'Enter API key:',
-      });
-
-      if (p.isCancel(apiKey) || !apiKey) {
-        continue; // Back to configure menu
-      }
-
-      let defaultModel = 'gpt-4o-mini';
-      if (provider === 'anthropic') defaultModel = 'claude-3-haiku-20240307';
-
-      // Custom endpoint always asks for base URL first
-      let baseUrl: string | undefined;
-      if (provider === 'custom') {
-        const url = await p.text({
-          message: 'Base URL (OpenAI-compatible):',
-          placeholder: 'http://localhost:11434/v1',
-        });
-        if (p.isCancel(url)) { continue; }
-        if (url) baseUrl = url;
-      }
-
-      const customModel = await p.text({
-        message: 'Model name:',
-        placeholder: defaultModel,
-        defaultValue: defaultModel,
-      });
-
-      if (p.isCancel(customModel)) { continue; }
-
-      config.llm = {
-        provider: provider === 'custom' ? 'openai' : provider,
-        apiKey,
-        model: customModel || defaultModel,
-        baseUrl,
-      };
-
-      await saveConfig(config);
-      p.log.success(`LLM configured: ${config.llm.model} @ ${config.llm.baseUrl || 'default'}`);
-      p.log.info('Saved to config.json. Restart MCP server to apply.');
-      continue;
-    }
-
-    if (section === 'embedding') {
-      const embedding = await p.select({
-        message: 'Select embedding provider:',
-        options: [
-          { value: 'off', label: 'Off (default)', hint: 'BM25 fulltext only, ~50MB RAM' },
-          { value: 'api', label: 'API (recommended)', hint: 'OpenAI-compatible, zero local RAM, best quality' },
-          { value: 'fastembed', label: 'FastEmbed', hint: 'local ONNX, ~300MB RAM' },
-          { value: 'transformers', label: 'Transformers', hint: 'local JS/WASM, ~500MB RAM' },
-        ],
-      });
-
-      if (p.isCancel(embedding)) continue; // Back to configure menu
-
-      if (embedding === 'api') {
-        const apiKey = await p.password({
-          message: 'Embedding API key (leave empty to reuse LLM key):',
-        });
-
-        if (p.isCancel(apiKey)) continue;
-
-        const baseUrl = await p.text({
-          message: 'Base URL:',
-          placeholder: 'https://api.openai.com/v1',
-          defaultValue: '',
-        });
-
-        if (p.isCancel(baseUrl)) continue;
-
-        const modelChoice = await p.select({
-          message: 'Embedding model:',
-          options: [
-            { value: 'text-embedding-3-small', label: 'OpenAI text-embedding-3-small', hint: '1536d, $0.02/1M tokens' },
-            { value: 'text-embedding-3-large', label: 'OpenAI text-embedding-3-large', hint: '3072d, best quality' },
-            { value: 'text-embedding-v3', label: 'Qwen text-embedding-v3', hint: '1024d, Chinese+English' },
-            { value: 'text-embedding-v4', label: 'Qwen text-embedding-v4', hint: 'latest, Chinese+English' },
-            { value: 'custom', label: 'Custom model', hint: 'enter model name' },
-          ],
-        });
-
-        if (p.isCancel(modelChoice)) continue;
-
-        let model: string = modelChoice;
-        if (modelChoice === 'custom') {
-          const customName = await p.text({
-            message: 'Model name:',
-            placeholder: 'e.g., BAAI/bge-m3',
-          });
-          if (p.isCancel(customName) || !customName) continue;
-          model = customName;
-        }
-
-        const dimInput = await p.text({
-          message: 'Dimension override (optional, press Enter to auto-detect):',
-          placeholder: 'e.g., 512 for cost savings',
-          defaultValue: '',
-        });
-
-        const dims = (!p.isCancel(dimInput) && dimInput) ? parseInt(dimInput, 10) : null;
-
-        config.embedding = 'api';
-        config.embeddingApi = {
-          apiKey: apiKey || undefined,
-          baseUrl: baseUrl || undefined,
-          model,
-          dimensions: (dims && !isNaN(dims)) ? dims : undefined,
-        };
-
-        await saveConfig(config);
-        p.log.success(`API embedding configured: ${model}`);
-        p.log.info('Saved to config.json. Restart MCP server to apply.');
-        continue;
-      }
-
-      config.embedding = embedding;
-      delete config.embeddingApi;
-
-      await saveConfig(config);
-
-      if (embedding === 'off') {
-        p.log.success('Embedding disabled. Using BM25 fulltext search.');
-      } else {
-        p.log.success(`Embedding set to: ${embedding}`);
-        p.log.info(`Install with: npm install -g ${embedding === 'fastembed' ? 'fastembed' : '@huggingface/transformers'}`);
-      }
-      p.log.info('Saved to config.json. Restart MCP server to apply.');
-      continue;
-    }
-
-    if (section === 'behavior') {
-      const current = config.behavior ?? {};
-
-      const sessionInject = await p.select({
-        message: `Session start injection (current: ${current.sessionInject ?? 'minimal'})`,
-        options: [
-          { value: 'full', label: 'Full', hint: 'inject top 5 memories on session start' },
-          { value: 'minimal', label: 'Minimal (default)', hint: 'one-line hint only' },
-          { value: 'silent', label: 'Silent', hint: 'no injection, rely on rules/AGENTS.md' },
-        ],
-      });
-      if (p.isCancel(sessionInject)) continue;
-
-      const syncAdvisory = await p.confirm({
-        message: `Show sync advisory on first search? (current: ${current.syncAdvisory !== false ? 'yes' : 'no'})`,
-        initialValue: current.syncAdvisory !== false,
-      });
-      if (p.isCancel(syncAdvisory)) continue;
-
-      const autoCleanup = await p.confirm({
-        message: `Auto-archive expired memories on startup? (current: ${current.autoCleanup !== false ? 'yes' : 'no'})`,
-        initialValue: current.autoCleanup !== false,
-      });
-      if (p.isCancel(autoCleanup)) continue;
-
-      const formationMode = await p.select({
-        message: `Formation Pipeline mode (current: ${current.formationMode ?? 'active'})`,
-        options: [
-          { value: 'active', label: 'Active (default)', hint: 'Formation decides storage (new/merge/evolve/discard)' },
-          { value: 'shadow', label: 'Shadow', hint: 'Formation observes only, old compact decides' },
-          { value: 'fallback', label: 'Fallback', hint: 'Old compact decides (safe rollback)' },
-        ],
-      });
-      if (p.isCancel(formationMode)) continue;
-
-      config.behavior = {
-        sessionInject,
-        syncAdvisory,
-        autoCleanup,
-        formationMode,
-      };
-
-      await saveConfig(config);
-      p.log.success('Behavior settings updated.');
-      p.log.info('Saved to config.json. Restart MCP server to apply.');
-      continue;
-    }
-  }
-}
-
-async function runSearch(query: string): Promise<void> {
-  const s = p.spinner();
-  s.start('Searching memories...');
-  
-  try {
-    const { searchObservations, getDb } = await import('../store/orama-store.js');
-    const { getProjectDataDir } = await import('../store/persistence.js');
-    const { detectProject } = await import('../project/detector.js');
-    const { initObservations } = await import('../memory/observations.js');
-    
-    const project = detectProject(process.cwd());
-    if (!project) { s.stop('No .git found'); p.log.error('Not a project directory. Run "git init" first.'); return; }
-    const dataDir = await getProjectDataDir(project.id);
-    await initObservations(dataDir);
-    await getDb(); // Ensure Orama is initialized
-    
-    const results = await searchObservations({ query, limit: 10, projectId: project.id });
-    s.stop('Search complete');
-    
-    if (results.length === 0) {
-      p.log.warn('No memories found matching your query.');
+/**
+ * Set PI_PACKAGE_DIR so bundled memcode can find its theme files.
+ * When tsup bundles memcode into the CLI, __dirname points to dist/cli/,
+ * not packages/memcode/. This env var tells config.ts where to look.
+ *
+ * In dev: resolves to packages/memcode/
+ * In global npm install: packages/memcode/ won't exist; theme files
+ *   should be copied to dist/memcode/ by the build (see tsup onSuccess).
+ */
+function ensureMemcodePackageDir(): void {
+  if (process.env.MEMCODE_PACKAGE_DIR) return;
+  // Walk up from __dirname (dist/cli/) to find packages/memcode/package.json
+  const path = require('node:path') as typeof import('node:path');
+  const fs = require('node:fs') as typeof import('node:fs');
+  let dir: string = __dirname;
+  for (let i = 0; i < 5; i++) {
+    const candidate = path.join(dir, 'packages', 'memcode');
+    if (fs.existsSync(path.join(candidate, 'package.json'))) {
+      process.env.MEMCODE_PACKAGE_DIR = candidate;
       return;
     }
-    
-    p.log.success(`Found ${results.length} memories:`);
-    console.log('');
-    for (const r of results) {
-      console.log(`  ${r.icon} #${r.id} ${r.title}`);
-      console.log(`     ${r.time} | ${r.tokens} tokens | score: ${(r.score ?? 0).toFixed(2)}`);
-      console.log('');
-    }
-  } catch (err) {
-    s.stop('Search failed');
-    p.log.error(`Error: ${err instanceof Error ? err.message : err}`);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
 }
 
-async function runList(): Promise<void> {
-  const s = p.spinner();
-  s.start('Loading recent memories...');
-  
+const DIM = '\x1b[2m';
+const RESET = '\x1b[0m';
+const CYAN = '\x1b[36m';
+const YELLOW = '\x1b[33m';
+
+async function runAsk(question: string): Promise<void> {
+  // Use a smooth dots-style spinner (same frames as TUI ink-spinner "dots")
+  // instead of @clack's ASCII spinner which flickers in non-Ink terminals.
+  const dotsFrames = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+  let frameIdx = 0;
+  let interval: ReturnType<typeof setInterval> | null = null;
+
+  const startSmoothSpinner = (msg: string) => {
+    if (process.stdout.isTTY) {
+      process.stdout.write(`${CYAN}${dotsFrames[0]}${RESET} ${msg}`);
+      interval = setInterval(() => {
+        frameIdx = (frameIdx + 1) % dotsFrames.length;
+        process.stdout.write(`\r${CYAN}${dotsFrames[frameIdx]}${RESET} ${msg}`);
+      }, 80);
+    } else {
+      process.stderr.write(`${msg}...\n`);
+    }
+  };
+
+  const stopSmoothSpinner = () => {
+    if (interval) { clearInterval(interval); interval = null; }
+    if (process.stdout.isTTY) {
+      process.stdout.write('\r' + ' '.repeat(40) + '\r'); // clear line
+    }
+  };
+
+  startSmoothSpinner('Thinking…');
+
   try {
-    const { getProjectDataDir, loadObservationsJson } = await import('../store/persistence.js');
-    const { detectProject } = await import('../project/detector.js');
-    
-    const project = detectProject(process.cwd());
-    if (!project) { s.stop('No .git found'); p.log.error('Not a project directory. Run "git init" first.'); return; }
-    const dataDir = await getProjectDataDir(project.id);
-    const observations = await loadObservationsJson(dataDir) as Array<{
-      id: number; title: string; type: string; timestamp: string; status?: string;
-    }>;
-    
-    const active = observations.filter(o => (o.status ?? 'active') === 'active');
-    const recent = active.slice(-10).reverse();
-    
-    s.stop(`Project: ${project.name} (${active.length} active memories)`);
-    
-    if (recent.length === 0) {
-      p.log.warn('No memories found.');
-      return;
-    }
-    
-    console.log('');
-    for (const o of recent) {
-      const typeLabel = { gotcha: '[!]', decision: '[D]', 'problem-solution': '[S]', discovery: '[?]', 'how-it-works': '[H]', 'what-changed': '[C]' }[o.type] ?? '[·]';
-      console.log(`  ${typeLabel} #${o.id} ${o.title?.slice(0, 60) ?? '(untitled)'}`);
-    }
-    console.log('');
-  } catch (err) {
-    s.stop('Failed to load memories');
-    p.log.error(`Error: ${err instanceof Error ? err.message : err}`);
-  }
-}
+    const { askMemoryQuestion } = await import('./tui/chat-service.js');
+    const result = await askMemoryQuestion(question);
 
-async function runCommand(cmd: string, _args: string[] = []): Promise<void> {
-  // Direct imports to ensure bundler includes them
-  // Using 'as any' to bypass citty's strict type checking for manual invocation
-  switch (cmd) {
-    case 'dashboard': {
-      const m = await import('./commands/dashboard.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
+    stopSmoothSpinner();
+
+    // Output the answer
+    console.log('');
+    console.log(result.answer);
+
+    // Show sources if any
+    if (result.sources.length > 0) {
+      console.log('');
+      console.log(`${DIM}Sources:${RESET}`);
+      for (const src of result.sources.slice(0, 5)) {
+        console.log(`  ${DIM}[obs:${src.id}]${RESET} ${src.title}`);
+      }
     }
-    case 'status': {
-      const m = await import('./commands/status.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
+
+    // Show warnings
+    if (result.warning) {
+      console.log('');
+      console.log(`${YELLOW}[WARN] ${result.warning}${RESET}`);
     }
-    case 'cleanup': {
-      const m = await import('./commands/cleanup.js');
-      await m.default.run?.({ args: { _: [], dry: false, force: false }, rawArgs: [], cmd: m.default } as any);
-      break;
+
+    // Metadata footer
+    const meta: string[] = [];
+    if (result.usedLLM && result.llmModel) meta.push(result.llmModel);
+    if (result.searchMode) meta.push(result.searchMode);
+    if (result.toolCallsCount) meta.push(`${result.toolCallsCount} tool call${result.toolCallsCount > 1 ? 's' : ''}`);
+    if (meta.length > 0) {
+      console.log(`${DIM}  ${meta.join(' · ')}${RESET}`);
     }
-    case 'sync': {
-      const m = await import('./commands/sync.js');
-      await m.default.run?.({ args: { _: [], dry: false }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
-    case 'serve': {
-      const m = await import('./commands/serve.js');
-      await m.default.run?.({ args: { _: [] }, rawArgs: [], cmd: m.default } as any);
-      break;
-    }
+  } catch (err) {
+    stopSmoothSpinner();
+    p.log.error(`Error: ${err instanceof Error ? err.message : err}`);
+    process.exitCode = 1;
   }
 }
 
@@ -601,14 +129,140 @@ async function runCommand(cmd: string, _args: string[] = []): Promise<void> {
 // Main command
 // ============================================================
 
+async function runMemoryShortcut(action: string, args: Record<string, unknown>): Promise<void> {
+  const { detectProject } = await import('../project/detector.js');
+  if (!detectProject(process.cwd())) {
+    console.log(NO_GIT_MSG);
+    process.exitCode = 1;
+    return;
+  }
+  const memory = await import('./commands/memory.js');
+  await memory.default.run?.({
+    args: { ...args, _: [action] },
+    rawArgs: [],
+    cmd: memory.default,
+  } as any);
+}
+
 const main = defineCommand({
   meta: {
     name: 'memorix',
-    version: pkg.version,
-    description: 'Cross-Agent Memory Bridge — Universal memory layer for AI coding agents via MCP',
+    version: getCliVersion(),
+    description: 'Local-first memory control plane for AI coding agents through CLI, MCP, and local workflows',
   },
   subCommands: {
+    // One-shot product commands (primary user paths)
+    ask: () => Promise.resolve(defineCommand({
+      meta: { name: 'ask', description: 'Ask Memorix a question (single-shot chat). Pipe: echo "q" | memorix ask' },
+      args: {
+        question: { type: 'positional', description: 'Question to ask (or pipe via stdin)', required: false },
+      },
+      async run({ args }) {
+        let q = (args.question as string) || '';
+        // Read from stdin if no positional arg and stdin is piped
+        if (!q && !process.stdin.isTTY) {
+          q = await new Promise<string>((resolve) => {
+            let data = '';
+            process.stdin.setEncoding('utf-8');
+            process.stdin.on('data', (chunk) => { data += chunk; });
+            process.stdin.on('end', () => resolve(data.trim()));
+            process.stdin.on('error', () => resolve(''));
+          });
+        }
+        if (!q) {
+          p.log.error('No question provided. Usage: memorix ask "your question" or echo "q" | memorix ask');
+          return;
+        }
+        await runAsk(q);
+      },
+    })),
+    search: () => Promise.resolve(defineCommand({
+      meta: { name: 'search', description: 'Shortcut for `memorix memory search`' },
+      args: {
+        query: { type: 'positional', description: 'Search query', required: true },
+        limit: { type: 'string', description: 'Maximum results' },
+        quality: { type: 'string', description: 'Retrieval profile: fast, balanced (default), or thorough' },
+        json: { type: 'boolean', description: 'Emit machine-readable JSON output' },
+      },
+      async run({ args }) {
+        await runMemoryShortcut('search', {
+          query: args.query,
+          limit: args.limit,
+          quality: args.quality,
+          json: args.json,
+        });
+      },
+    })),
+    remember: () => Promise.resolve(defineCommand({
+      meta: { name: 'remember', description: 'Shortcut for `memorix memory store`' },
+      args: {
+        text: { type: 'positional', description: 'Text to remember', required: true },
+        title: { type: 'string', description: 'Optional observation title' },
+        type: { type: 'string', description: 'Observation type' },
+        visibility: { type: 'string', description: 'project (default), personal, or team' },
+        json: { type: 'boolean', description: 'Emit machine-readable JSON output' },
+      },
+      async run({ args }) {
+        await runMemoryShortcut('store', {
+          text: args.text,
+          title: args.title,
+          type: args.type,
+          visibility: args.visibility,
+          json: args.json,
+        });
+      },
+    })),
+    recent: () => Promise.resolve(defineCommand({
+      meta: { name: 'recent', description: 'Shortcut for `memorix memory recent`' },
+      args: {
+        limit: { type: 'string', description: 'Maximum results' },
+        json: { type: 'boolean', description: 'Emit machine-readable JSON output' },
+      },
+      async run({ args }) { await runMemoryShortcut('recent', { limit: args.limit, json: args.json }); },
+    })),
+    help: () => Promise.resolve(defineCommand({
+      meta: { name: 'help', description: 'Show action-oriented help for a command group' },
+      args: {
+        command: { type: 'positional', description: 'Command group to inspect', required: false },
+      },
+      async run({ args }) {
+        console.log(renderCliGuide(args.command as string | undefined));
+      },
+    })),
+    // Infrastructure commands
     init: () => import('./commands/init.js').then(m => m.default),
+    setup: () => import('./commands/setup.js').then(m => m.default),
+    config: () => Promise.resolve(defineCommand({
+      meta: { name: 'config', description: 'Inspect Memorix TOML configuration' },
+      subCommands: {
+        path: () => import('./commands/config-path.js').then(m => m.default),
+        get: () => import('./commands/config-get.js').then(m => m.default),
+        migrate: () => import('./commands/config-migrate.js').then(m => m.default),
+      },
+    })),
+    integrate: () => import('./commands/integrate.js').then(m => m.default),
+    memory: () => import('./commands/memory.js').then(m => m.default),
+    context: () => import('./commands/context.js').then(m => m.default),
+    resume: () => import('./commands/resume.js').then(m => m.default),
+    explain: () => import('./commands/explain.js').then(m => m.default),
+    codegraph: () => import('./commands/codegraph.js').then(m => m.default),
+    checkpoint: () => import('./commands/checkpoint.js').then(m => m.default),
+    knowledge: () => import('./commands/knowledge.js').then(m => m.default),
+    reasoning: () => import('./commands/reasoning.js').then(m => m.default),
+    retention: () => import('./commands/retention.js').then(m => m.default),
+    formation: () => import('./commands/formation.js').then(m => m.default),
+    audit: () => import('./commands/audit.js').then(m => m.default),
+    transfer: () => import('./commands/transfer.js').then(m => m.default),
+    skills: () => import('./commands/skills.js').then(m => m.default),
+    identity: () => import('./commands/identity.js').then(m => m.default),
+    session: () => import('./commands/session.js').then(m => m.default),
+    team: () => import('./commands/team.js').then(m => m.default),
+    task: () => import('./commands/task.js').then(m => m.default),
+    message: () => import('./commands/message.js').then(m => m.default),
+    lock: () => import('./commands/lock.js').then(m => m.default),
+    handoff: () => import('./commands/handoff.js').then(m => m.default),
+    poll: () => import('./commands/poll.js').then(m => m.default),
+    receipt: () => import('./commands/receipt.js').then(m => m.default),
     serve: () => import('./commands/serve.js').then(m => m.default),
     'serve-http': () => import('./commands/serve-http.js').then(m => m.default),
     status: () => import('./commands/status.js').then(m => m.default),
@@ -616,29 +270,137 @@ const main = defineCommand({
     hook: () => import('./commands/hook.js').then(m => m.default),
     hooks: () => import('./commands/hooks.js').then(m => m.default),
     ingest: () => import('./commands/ingest.js').then(m => m.default),
+    media: () => import('./commands/media.js').then(m => m.default),
     'git-hook': () => import('./commands/git-hook-install.js').then(m => m.default),
     'git-hook-uninstall': () => import('./commands/git-hook-uninstall.js').then(m => m.default),
+    background: () => import('./commands/background.js').then(m => m.default),
+    bg: () => import('./commands/background.js').then(m => m.default),
+    bs: () => Promise.resolve(defineCommand({
+      meta: { name: 'bs', description: 'Shortcut: background start' },
+      args: { port: { type: 'string', description: 'HTTP port (default: 3211)', required: false } },
+      async run({ args }) {
+        // Directly invoke background start instead of going through citty's CommandContext
+        const port = parseInt((args.port as string) || '3211', 10);
+        const { doStart } = await import('./commands/background.js');
+        await doStart(port);
+      },
+    })),
+    doctor: () => import('./commands/doctor.js').then(m => m.default),
+    repair: () => import('./commands/repair.js').then(m => m.default),
     dashboard: () => import('./commands/dashboard.js').then(m => m.default),
     cleanup: () => import('./commands/cleanup.js').then(m => m.default),
+    purge: () => import('./commands/purge.js').then(m => m.default),
+    uninstall: () => import('./commands/uninstall.js').then(m => m.default),
+    orchestrate: () => import('./commands/orchestrate.js').then(m => m.default),
+    workbench: () => Promise.resolve(defineCommand({
+      meta: { name: 'workbench', description: 'Open the interactive terminal memory control plane' },
+      async run() {
+        const { startWorkbench } = await import('./workbench.js');
+        await startWorkbench();
+      },
+    })),
+    memcode: () => Promise.resolve(defineCommand({
+      meta: { name: 'memcode', description: 'Enter memcode TUI — native coding agent with memory' },
+      async run() {
+        try {
+          const { runCli } = await importBundledMemcode();
+          await runCli(process.argv.slice(3));
+        } catch (err) {
+          console.error('Failed to start memcode:', err instanceof Error ? err.message : err);
+          process.exit(1);
+        }
+      },
+    })),
   },
   async run() {
-    // No subcommand provided — show interactive TUI menu if in TTY, otherwise show help
+    // Guard: if citty already resolved a subcommand, its run() was called before this.
+    // Detect by checking if the first CLI arg matches a registered subcommand name.
+    const firstArg = process.argv[2];
+    const knownSubs = ['ask', 'search', 'remember', 'recent', 'help', 'workbench', 'memcode', 'config',
+      'init', 'setup', 'integrate', 'memory', 'context', 'resume', 'explain', 'codegraph', 'checkpoint', 'knowledge', 'reasoning', 'retention', 'formation', 'audit', 'transfer', 'skills', 'identity',
+      'session', 'team', 'task', 'message', 'lock', 'handoff', 'poll',
+      'receipt',
+      'serve', 'serve-http', 'status', 'sync',
+      'hook', 'hooks', 'ingest', 'media', 'git-hook', 'git-hook-uninstall',
+      'background', 'bg', 'bs', 'doctor', 'repair', 'dashboard', 'cleanup', 'purge', 'uninstall', 'orchestrate'];
+    if (firstArg && knownSubs.includes(firstArg)) return;
+
+    // No subcommand provided — enter memcode TUI (native coding agent)
+    if (!firstArg) {
+      try {
+        const { runCli } = await importBundledMemcode();
+        await runCli(process.argv.slice(2));
+        return;
+      } catch (err) {
+        console.error('Failed to start memcode:', err instanceof Error ? err.message : err);
+        process.exit(1);
+      }
+    }
+
+    // Fallback: show usage hint
     if (process.stdout.isTTY && process.stdin.isTTY) {
-      await interactiveMenu();
+      // Fire-and-forget: background update check. Default is notify-only; stderr only, never blocks TUI.
+      import('./update-checker.js').then(m => m.checkForUpdates()).catch(() => {});
+      const { startWorkbench } = await import('./workbench.js');
+      await startWorkbench();
     } else {
       // Non-interactive mode: show usage hint
-      console.error(`Memorix v${pkg.version} — Cross-Agent Memory Bridge\n`);
+      console.error(`Memorix v${getCliVersion()} — Local-first memory control plane\n`);
       console.error('Usage: memorix <command>\n');
       console.error('Commands:');
-      console.error('  serve      Start MCP Server on stdio');
+      console.error('  help       Show action-oriented help (`memorix memory --help`)');
+      console.error('  workbench  Open interactive terminal memory control plane');
+      console.error('  memcode    Enter memcode TUI (native coding agent)');
+      console.error('  ask "q"    Ask Memorix a question (single-shot chat)');
+      console.error('             Pipe: echo "q" | memorix ask');
+      console.error('  background Start/stop/status background control plane');
+      console.error('  session    Start/end/context for coding sessions');
+      console.error('  memory     Search/store/detail/timeline/resolve observations');
+      console.error('  context    Show the Memory Autopilot brief for this project');
+      console.error('  resume     Resume prior work with one bounded project brief');
+      console.error('  explain    Explain where Memorix project context comes from');
+      console.error('  codegraph  Refresh/status/context-pack for CodeGraph Memory');
+      console.error('  checkpoint Inspect native compact continuity checkpoints');
+      console.error('  knowledge  Review source-backed knowledge pages and project workflows');
+      console.error('  reasoning  Store/search decision rationale');
+      console.error('  retention  Inspect stale/archive status');
+      console.error('  formation  Inspect Memory Formation metrics');
+      console.error('  audit      Audit trail and project attribution checks');
+      console.error('  transfer   Export/import memory snapshots');
+      console.error('  skills     List/generate/show project skills');
+      console.error('  identity   Select the explicit CLI actor for private/team memory');
+      console.error('  team       Join/status/role operations for coordination state');
+      console.error('  task       Create/claim/complete/list team tasks');
+      console.error('  message    Send/broadcast/read team messages');
+      console.error('  lock       Manage advisory file locks');
+      console.error('  handoff    Create durable handoff artifacts');
+      console.error('  poll       Snapshot project coordination state');
+      console.error('  receipt    Privacy-safe memory handoff diagnostic');
+      console.error('  serve-http Start HTTP MCP + dashboard control plane');
+      console.error('  serve      Start MCP server on stdio');
+      console.error('  init       Create global defaults or project config');
+      console.error('  setup      Install Memorix plugin/MCP/rules/hooks for an agent');
+      console.error('  repair     Repair Memorix-owned agent integration files');
+      console.error('  config     Show TOML config paths and resolved values');
+      console.error('  integrate  Install one IDE integration into the current repo');
       console.error('  status     Show project info + stats');
-      console.error('  dashboard  Open Web Dashboard');
-      console.error('  hooks      Install hooks for IDEs');
+      console.error('  dashboard  Open standalone dashboard (read-mostly)');
+      console.error('  hooks      Open legacy hook installer menu');
       console.error('  cleanup    Remove old memories');
-      console.error('  sync       Cross-agent rule sync');
-      console.error('\nRun `memorix` in an interactive terminal for guided menu.');
+      console.error('  purge      Retire all memories (project by default, --all for everything)');
+      console.error('  sync       Rules/workspace sync plus interactive wizard');
+      console.error('  ingest     Ingest commit, log, or image knowledge');
+      console.error('\nRun `memorix` in an interactive terminal for memcode TUI.');
     }
   },
 });
 
-runMain(main);
+try {
+  normalizeCliInvocation();
+  if (!printCliGuideForHelp()) {
+    runMain(main);
+  }
+} catch (error) {
+  console.error(`Memorix CLI invocation error: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
+}

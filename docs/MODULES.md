@@ -1,7 +1,11 @@
 # Memorix 模块详解
 
-> 最后更新: 2026-03-09 (v1.0.0)
+> 最后更新: 2026-08-14 (v1.4.3)
 > 本文档详细记录每个模块的实现细节、关键算法和注意事项
+
+> 本文档中的早期 JSON/Orama 章节保留为历史模块说明。当前运行时的
+> SQLite 数据层和长期记忆生命周期以 `docs/ARCHITECTURE.md`、
+> `docs/1.3-MEMORY-ARCHITECTURE.md` 及对应源码为准。
 
 ---
 
@@ -63,7 +67,7 @@ const schema = {
 ├── relations.jsonl        # 知识图谱边 (每行一个 JSON)
 ├── sessions.json          # 会话历史
 ├── mini-skills.json       # 永久技能
-└── team-state.json        # 团队协作状态
+└── team-state.json        # 编排协调状态
 ```
 
 ### JSONL 格式 (MCP 兼容)
@@ -148,6 +152,28 @@ Archive-candidate: age > 100% retention & !immune
 
 ---
 
+## 5. 长期记忆 (`memory/long-term.ts`, `memory/long-term-store.ts`)
+
+长期记忆不是把所有 observation 再复制一遍。它是由已有证据支撑、经过
+明确管理的少量长期知识，面向跨会话持续使用。
+
+| 维度 | 取值 | 含义 |
+|---|---|---|
+| 认知类型 | `episodic` / `semantic` / `procedural` | 完成经历、稳定事实、可复用流程 |
+| 范围 | `project` / `user` / `team` | 项目、同一安装的用户、显式团队 |
+| 生命周期 | `candidate` -> `qualified` -> `approved` -> `archived` / `superseded` | 候选不会自动注入；只有合格或已批准的记录才会进入受限 Workset |
+
+### 核心边界
+
+- 每条记录保存来源 observation 和生命周期事件，便于审计和追溯。
+- `portable` 只允许用户范围、并且来源是显式手工或用户输入的记录。
+- Git、代码、会话、项目、团队和模型生成的证据不能因为标记为长期记忆就跨项目共享。
+- 用户通过 `memorix memory long-term` 管理记录；MCP 的 `memorix_store`
+  只能创建候选，不会偷偷把日常对话升级成长期知识。
+- 检索遵守任务相关性和 token 预算，最多放入少量合格/批准记录，不回填完整历史。
+
+---
+
 ## 5. 实体抽取器 (`memory/entity-extractor.ts`)
 
 ### 正则模式
@@ -225,12 +251,15 @@ FastEmbedProvider (实现)
 ### 优雅降级
 ```
 getEmbeddingProvider()
-  ├── 尝试 import('fastembed') → 成功 → 返回 FastEmbedProvider
-  └── 失败 → 返回 null → Orama 退化为纯 BM25 搜索
+  ├── MEMORIX_EMBEDDING=off → 返回 null → Orama 使用 BM25
+  ├── MEMORIX_EMBEDDING=api → OpenAI-compatible embedding provider
+  ├── MEMORIX_EMBEDDING=fastembed → import('fastembed')
+  ├── MEMORIX_EMBEDDING=transformers → import('@huggingface/transformers')
+  └── MEMORIX_EMBEDDING=auto → API config first, then local fallback
 ```
 
 ### ⚠️ 注意事项
-- `fastembed` 是**可选依赖** — 不在 `dependencies` 中
+- `fastembed` 是**显式可选能力** — 不随默认安装拉取；需要时由用户安装
 - Singleton 模式: 全局只有一个 provider 实例
 - `resetProvider()` 仅用于测试
 - Float32Array → number[] 转换是必要的 (Orama 需要 plain array)
@@ -311,7 +340,7 @@ confidence = baseConfidence + matchCount × 0.05
 | Claude Code | JSON (`claude_desktop_config.json`) | 平台特定 |
 | Codex | TOML | `codex.toml` |
 | Copilot | JSON | `.github/copilot/mcp.json` |
-| Antigravity | JSON | `~/.gemini/antigravity/mcp_config.json` |
+| Antigravity | JSON | `~/.gemini/config/mcp_config.json` or `.agents/mcp_config.json` |
 
 ### Workflow 同步
 - 扫描 Windsurf 的 `.windsurf/workflows/` 目录

@@ -1,6 +1,10 @@
 # Memorix Team Protocol
 
-Rules for multi-agent coordination via Memorix team tools. All agents sharing a workspace MUST follow this protocol to prevent conflicts and enable structured collaboration.
+Rules for project-scoped autonomous-agent coordination via Memorix team tools. The Team page is an **Agent Team status surface** — it shows explicitly joined autonomous agents, open tasks, locks, messages, handoffs, and what needs attention. It is NOT an organization backend, staffing admin tool, or automatic chat room between separate IDE windows.
+
+Only agents that are intentionally participating in team/task/message/lock workflows need this protocol. Memory-only sessions should stay lightweight and do not need a team identity.
+
+For real autonomous multi-agent development, prefer `memorix orchestrate`: it launches and supervises CLI agent workers through Memorix tasks, context, verification, and fix loops. The team tools support that workflow; they should not be interpreted as proof that unrelated IDE conversation windows can autonomously contact each other.
 
 There are 4 team tools, each with an `action` parameter:
 
@@ -9,14 +13,18 @@ There are 4 team tools, each with an `action` parameter:
 - `team_task` — action: create / claim / complete / list
 - `team_message` — action: send / broadcast / inbox
 
-## RULE 1: Join on Session Start
+## RULE 1: Start Lightweight, Join Team Explicitly
 
-At the **beginning of every session**, before any other work:
+At the **beginning of every memory session**, before project-scoped memory work:
 
-1. Call `team_manage` with `action: "join"`, a descriptive `name` (format: `{ide}-{role}`, e.g. `windsurf-backend`, `cursor-frontend`), and a short `role`. Include `capabilities` if relevant.
-2. Store the returned **agent ID** — you will need it for all subsequent team operations.
-3. Call `team_manage` with `action: "status"` to see who else is active. If other agents are present, check their roles and current work to avoid overlap.
-4. Call `team_message` with `action: "inbox"` and your agent ID to check for pending messages. Read and act on any unread messages before starting new work.
+1. Call `memorix_session_start` to bind the project, open the session, and restore context.
+2. By default, `memorix_session_start` is **lightweight**: it does **not** create a team identity.
+3. If you actually want to participate in autonomous agent tasks, messages, or locks, explicitly join in one of two ways:
+   - call `memorix_session_start` with `joinTeam: true`
+   - or call `team_manage` with `action: "join"`
+4. Store the returned **agent ID** only after an explicit join — you will need it for subsequent team operations.
+5. Call `memorix_poll` with your agent ID to see current autonomous agents, check available tasks, and read unread messages.
+6. If you need a custom role or capabilities, use explicit `team_manage(join)` so the role overrides the default mapping cleanly.
 
 ## RULE 2: Lock Before Edit
 
@@ -87,7 +95,9 @@ When the session is ending:
 
 | When | Tool Call |
 |------|-----------|
-| Session start | `team_manage(join)`, `team_manage(status)`, `team_message(inbox)` |
+| Session start | `memorix_session_start` (lightweight) |
+| Join Agent Team | `memorix_session_start(joinTeam=true)` or `team_manage(join)` |
+| After joining | `memorix_poll` (check status + inbox) |
 | Before editing a shared file | `team_file_lock(status)`, `team_file_lock(lock)` |
 | After editing | `team_file_lock(unlock)` |
 | Starting a unit of work | `team_task(claim)` or `team_task(create)` + `team_task(claim)` |

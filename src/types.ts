@@ -42,16 +42,17 @@ export interface KnowledgeGraph {
  * Observation type classification using claude-mem's icon-based legend system.
  *
  * Icon mapping:
- * 🎯 session-request   — User's original goal
- * 🔴 gotcha            — Critical pitfall / trap
- * 🟡 problem-solution  — Bug fix or workaround
- * 🔵 how-it-works      — Technical explanation
- * 🟢 what-changed      — Code/architecture change
- * 🟣 discovery         — New learning or insight
- * 🟠 why-it-exists     — Design rationale
- * 🟤 decision          — Architecture decision
- * ⚖️ trade-off         — Deliberate compromise
- * 🧠 reasoning         — Why this approach was chosen (System 2 reasoning trace)
+ * [SESSION] session-request   — User's original goal
+ * [GOTCHA] gotcha            — Critical pitfall / trap
+ * [FIX] problem-solution  — Bug fix or workaround
+ * [INFO] how-it-works      — Technical explanation
+ * [CHANGE] what-changed      — Code/architecture change
+ * [DISCOVERY] discovery         — New learning or insight
+ * [WHY] why-it-exists     — Design rationale
+ * [DECISION] decision          — Architecture decision
+ * [TRADEOFF] trade-off         — Deliberate compromise
+ * [REASONING] reasoning         — Why this approach was chosen (System 2 reasoning trace)
+ * [PROBE] probe                — Operational heartbeat / connectivity check (short-lived, excluded from default search)
  */
 export type ObservationType =
   | 'session-request'
@@ -63,30 +64,68 @@ export type ObservationType =
   | 'why-it-exists'
   | 'decision'
   | 'trade-off'
-  | 'reasoning';
+  | 'reasoning'
+  | 'probe';
 
 /** Map from ObservationType to display icon */
 export const OBSERVATION_ICONS: Record<ObservationType, string> = {
-  'session-request': '🎯',
-  'gotcha': '🔴',
-  'problem-solution': '🟡',
-  'how-it-works': '🔵',
-  'what-changed': '🟢',
-  'discovery': '🟣',
-  'why-it-exists': '🟠',
-  'decision': '🟤',
-  'trade-off': '⚖️',
-  'reasoning': '🧠',
+  'session-request': '[SESSION]',
+  'gotcha': '[GOTCHA]',
+  'problem-solution': '[FIX]',
+  'how-it-works': '[INFO]',
+  'what-changed': '[CHANGE]',
+  'discovery': '[DISCOVERY]',
+  'why-it-exists': '[WHY]',
+  'decision': '[DECISION]',
+  'trade-off': '[TRADEOFF]',
+  'reasoning': '[REASONING]',
+  'probe': '[PROBE]',
 };
 
 /** Observation lifecycle status */
 export type ObservationStatus = 'active' | 'resolved' | 'archived';
+
+/**
+ * Control-plane admission state for automatically captured observations.
+ * Candidate and ephemeral records remain inspectable, but only qualified
+ * records are eligible for automatic context delivery. Missing state preserves
+ * legacy behavior for observations written before this policy existed.
+ */
+export type ObservationAdmissionState = 'ephemeral' | 'candidate' | 'qualified';
+
+/**
+ * Who may retrieve an observation through agent-facing memory surfaces.
+ * Missing visibility is a legacy record and resolves to `project`.
+ */
+export type ObservationVisibility = 'personal' | 'project' | 'team';
+
+/**
+ * Identity available to an agent-facing retrieval call. Internal maintenance
+ * deliberately omits this and may inspect all project records for lifecycle work.
+ */
+export interface ObservationReader {
+  /** Bound project for a normal project-scoped call. Omit only for explicit global search. */
+  projectId?: string;
+  /** Stable coordination identity, available after an explicit team join. */
+  agentId?: string;
+  /** True only when agentId is an active member of the bound project team. */
+  isTeamMember?: boolean;
+}
 
 /** Progress tracking for task/feature observations */
 export interface ProgressInfo {
   feature: string;
   status: 'in-progress' | 'completed' | 'blocked';
   completion?: number;
+}
+
+/** Safe media reference for an observation. Raw inline media is never persisted. */
+export interface ObservationAttachment {
+  modality: 'image' | 'audio' | 'video' | 'document';
+  /** Public HTTPS reference. Local paths, private hosts, and credentials are rejected. */
+  url: string;
+  mimeType?: string;
+  name?: string;
 }
 
 /** A rich observation record attached to an entity */
@@ -125,6 +164,24 @@ export interface Observation {
   relatedCommits?: string[];
   /** Related entity names — explicit cross-references to other memory entities */
   relatedEntities?: string[];
+  /** Safe media references and metadata; never contains inline payloads or credentials. */
+  attachments?: ObservationAttachment[];
+  /** Provenance detail: how this observation entered the system */
+  sourceDetail?: 'explicit' | 'hook' | 'git-ingest';
+  /** Value category from formation pipeline evaluation */
+  valueCategory?: 'core' | 'contextual' | 'ephemeral';
+  /** Control-plane admission state for automatic capture and delivery. */
+  admissionState?: ObservationAdmissionState;
+  /** Short, sanitized explanation for the latest admission decision. */
+  admissionReason?: string;
+  /** Retrieval scope. Legacy records without a value remain project-visible. */
+  visibility?: ObservationVisibility;
+  /** Explicit additional readers for a personal record, used by targeted handoffs. */
+  sharedWithAgentIds?: string[];
+  /** Phase 4a: Agent ID that created this observation (team attribution) */
+  createdByAgentId?: string;
+  /** Phase 4a: Monotonic write generation — snapshot of storage_generation at write time (watermark coherence) */
+  writeGeneration?: number;
 }
 
 // ============================================================
@@ -144,6 +201,52 @@ export interface Session {
 }
 
 // ============================================================
+// Cross-Agent Compaction Continuity
+// ============================================================
+
+/** Whether a checkpoint is still waiting for host compaction or has completed. */
+export type CompactionCheckpointPhase = 'pre' | 'complete';
+
+/** Native compaction reason when the host exposes it. */
+export type CompactionReason = 'manual' | 'auto' | 'unknown';
+
+/** How much first-party compaction evidence the host actually exposed. */
+export type CompactionCaptureKind = 'preflight' | 'lifecycle' | 'native-summary';
+
+/** Lifecycle state for a persisted compaction checkpoint. */
+export type CompactionCheckpointStatus = 'active' | 'archived';
+
+/**
+ * A source-aware record of one host-native context compaction.
+ *
+ * This is intentionally not an Observation: a host summary is evidence for
+ * continuation, not automatically durable project truth.
+ */
+export interface CompactionCheckpoint {
+  id: string;
+  projectId: string;
+  sessionId: string;
+  agent: string;
+  phase: CompactionCheckpointPhase;
+  captureKind: CompactionCaptureKind;
+  reason: CompactionReason;
+  sourceEvent: string;
+  sourceKey: string;
+  summary?: string;
+  tokensBefore?: number;
+  firstKeptEntryId?: string;
+  details?: Record<string, unknown>;
+  transcriptAvailable: boolean;
+  status: CompactionCheckpointStatus;
+  preCapturedAt: string;
+  completedAt?: string;
+  deliveredAt?: string;
+  deliveryCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ============================================================
 // Compact Engine (adopted from claude-mem 3-layer workflow)
 // ============================================================
 
@@ -157,6 +260,32 @@ export interface IndexEntry {
   tokens: number;
   /** Relevance score from search (time-decayed). Used by compact engine. */
   score?: number;
+  /** Project that owns this observation. Needed to disambiguate global results. */
+  projectId?: string;
+  /** Origin of the memory for source-aware retrieval and display. */
+  source?: 'agent' | 'git' | 'manual';
+  /** Provenance detail for source-aware display */
+  sourceDetail?: 'explicit' | 'hook' | 'git-ingest';
+  /** Value category for source-aware ranking */
+  valueCategory?: 'core' | 'contextual' | 'ephemeral';
+  /** Control-plane admission state when known. */
+  admissionState?: ObservationAdmissionState;
+  /** Retrieval scope when known. */
+  visibility?: ObservationVisibility;
+  /** Explainable recall: why this result matched. */
+  matchedFields?: string[];
+  /** Entity name — used for entity-affinity scoring and workstream deduplication. */
+  entityName?: string;
+  /** Document type: observation or mini-skill (Phase 3a) */
+  documentType?: DocumentType;
+  /** Knowledge layer for layer-aware ranking (Phase 3a) */
+  knowledgeLayer?: KnowledgeLayer;
+}
+
+/** Explicit reference to an observation, optionally scoped to a project. */
+export interface ObservationRef {
+  id: number;
+  projectId?: string;
 }
 
 /** L2 timeline context — observations around an anchor */
@@ -166,6 +295,9 @@ export interface TimelineContext {
   before: IndexEntry[];
   after: IndexEntry[];
 }
+
+/** Retrieval work allowed for a search request. */
+export type RetrievalQuality = 'fast' | 'balanced' | 'thorough';
 
 /** Search options for the compact engine */
 export interface SearchOptions {
@@ -181,6 +313,23 @@ export interface SearchOptions {
   status?: ObservationStatus | 'all';
   /** Filter by observation source: 'agent', 'git', 'manual', or undefined for all */
   source?: 'agent' | 'git' | 'manual';
+  /** Internal observability probes can disable access tracking without affecting normal search behavior. */
+  trackAccess?: boolean;
+  /** Internal reader context for agent-facing visibility filtering. */
+  reader?: ObservationReader;
+  /**
+   * Observation ids already surfaced earlier in the same session. Surfaced
+   * entries are demoted (never removed) so unseen evidence can rise into the
+   * result limit; a strong match still answers a new question.
+   */
+  surfacedIds?: number[];
+  /**
+   * `fast` stays fully local, `balanced` (default) permits embeddings, and
+   * `thorough` explicitly permits optional LLM query rewrite and reranking.
+   */
+  quality?: RetrievalQuality;
+  /** Abort provider-backed retrieval when the owning request is cancelled. */
+  signal?: AbortSignal;
 }
 
 /** Topic key family heuristics for suggesting stable topic keys */
@@ -208,6 +357,8 @@ export interface MemorixDocument {
   facts: string;
   filesModified: string;
   concepts: string;
+  /** Searchable, display-safe attachment provenance (one entry per line). */
+  attachments?: string;
   tokens: number;
   createdAt: string;
   projectId: string;
@@ -219,6 +370,26 @@ export interface MemorixDocument {
   status: string;
   /** Origin: agent, git, manual */
   source: string;
+  /** Provenance detail: explicit, hook, or git-ingest */
+  sourceDetail?: string;
+  /** Value category from formation evaluation */
+  valueCategory?: string;
+  /** Control-plane admission state for automatic capture and delivery. */
+  admissionState?: string;
+  /** Short, sanitized explanation for the latest admission decision. */
+  admissionReason?: string;
+  /** Retrieval scope for agent-facing filtering. */
+  visibility?: string;
+  /** Agent that owns a personal record, or authored a shared record. */
+  createdByAgentId?: string;
+  /** Explicit readers for a targeted personal record. */
+  sharedWithAgentIds?: string;
+  /** Optional vector embedding for semantic/hybrid retrieval */
+  embedding?: number[];
+  /** Document type: observation or mini-skill (Phase 3a) */
+  documentType?: DocumentType;
+  /** Knowledge layer for layer-aware ranking (Phase 3a) */
+  knowledgeLayer?: KnowledgeLayer;
 }
 
 // ============================================================
@@ -235,6 +406,7 @@ export type RuleSource =
   | 'codex'
   | 'windsurf'
   | 'antigravity'
+  | 'gemini-cli'
   | 'copilot'
   | 'kiro'
   | 'trae'
@@ -282,6 +454,29 @@ export interface ProjectInfo {
   rootPath: string;
 }
 
+/**
+ * Diagnostic failure info from project detection.
+ * Tells callers exactly WHY detection failed so they can report actionable errors.
+ */
+export type DetectionFailureReason =
+  | 'path_not_found'
+  | 'not_a_directory'
+  | 'no_git'
+  | 'git_worktree_error'
+  | 'git_safe_directory'
+  | 'remote_resolve_failed';
+
+export interface DetectionFailure {
+  reason: DetectionFailureReason;
+  path: string;
+  detail: string;
+}
+
+export interface DetectionResult {
+  project: ProjectInfo | null;
+  failure: DetectionFailure | null;
+}
+
 // ============================================================
 // Memorix Server Configuration
 // ============================================================
@@ -306,7 +501,20 @@ export const DEFAULT_CONFIG: Partial<MemorixConfig> = {
 // ============================================================
 
 /** Supported agent targets for workspace sync */
-export type AgentTarget = 'windsurf' | 'cursor' | 'claude-code' | 'codex' | 'copilot' | 'antigravity' | 'kiro' | 'opencode' | 'trae';
+export type AgentTarget =
+  | 'windsurf'
+  | 'cursor'
+  | 'claude-code'
+  | 'codex'
+  | 'copilot'
+  | 'antigravity'
+  | 'gemini-cli'
+  | 'openclaw'
+  | 'hermes'
+  | 'omp'
+  | 'kiro'
+  | 'opencode'
+  | 'trae';
 
 /** A unified MCP server entry across all agent config formats */
 export interface MCPServerEntry {
@@ -323,6 +531,8 @@ export interface MCPServerEntry {
   headers?: Record<string, string>;
   /** Whether this server is disabled */
   disabled?: boolean;
+  /** Claude Code: force small core tool sets to load before the first prompt */
+  alwaysLoad?: boolean;
 }
 
 /** Unified workflow entry */
@@ -378,7 +588,7 @@ export interface WorkspaceSyncResult {
 /** A mini-skill promoted from one or more observations */
 export interface MiniSkill {
   id: number;
-  /** Observation IDs this mini-skill was derived from */
+  /** Observation IDs this mini-skill was derived from (live refs, best-effort) */
   sourceObservationIds: number[];
   /** Entity the source observations belong to */
   sourceEntity: string;
@@ -398,11 +608,61 @@ export interface MiniSkill {
   usedCount: number;
   /** Classification tags */
   tags: string[];
+  /** Frozen source observation content at promote time (JSON, immutable provenance proof) */
+  sourceSnapshot?: string;
+  /** ISO timestamp of last modification (Phase 3a: set once at creation) */
+  updatedAt?: string;
+}
+
+// ============================================================
+// Source Snapshot — immutable provenance proof for promoted knowledge
+// ============================================================
+
+/** A single observation entry within a source snapshot */
+export interface SnapshotObservation {
+  id: number;
+  title: string;
+  type: string;
+  narrative: string;
+  facts: string[];
+  entityName: string;
+  projectId: string;
+  createdAt: string;
+  /** Frozen source detail for provenance (explicit / hook / git-ingest) */
+  sourceDetail?: string;
+}
+
+/** Frozen source content captured at promote time */
+export interface SourceSnapshot {
+  observations: SnapshotObservation[];
+  promotedAt: string;
+}
+
+// ============================================================
+// Knowledge Layer — Phase 3a retrieval classification
+// ============================================================
+
+/** Classification of knowledge for layer-aware ranking */
+export type KnowledgeLayer = 'project-truth' | 'promoted' | 'evidence';
+
+/** Document type discriminator for Orama index */
+export type DocumentType = 'observation' | 'mini-skill';
+
+// ============================================================
+// Typed Memory Reference — Phase 3a reference protocol
+// ============================================================
+
+/** A typed reference to a memory object (observation or mini-skill) */
+export interface MemoryRef {
+  kind: 'obs' | 'skill';
+  id: number;
+  projectId?: string;
 }
 
 /** MCP config format adapter interface */
 export interface MCPConfigAdapter {
-  readonly source: AgentTarget;
+  /** Setup-only adapters may support a host that does not participate in workspace sync. */
+  readonly source: AgentTarget | 'codebuddy' | 'dsh';
   /** Parse MCP server entries from a config file */
   parse(content: string): MCPServerEntry[];
   /** Generate config file content from MCP server entries */
@@ -410,3 +670,23 @@ export interface MCPConfigAdapter {
   /** Get the default config file path for this agent */
   getConfigPath(projectRoot?: string): string;
 }
+
+// Durable cognitive memory is intentionally kept in its own module so the
+// legacy Observation contract remains source/provenance focused.
+export type {
+  CreateLongTermMemoryInput,
+  LongTermMemory,
+  LongTermMemoryEvidence,
+  LongTermMemoryEvidenceInput,
+  LongTermMemoryEvidenceKind,
+  LongTermMemoryEvidenceRelation,
+  LongTermMemoryEvent,
+  LongTermMemoryEventKind,
+  LongTermMemoryKind,
+  LongTermMemoryOrigin,
+  LongTermMemoryPortability,
+  LongTermMemoryReader,
+  LongTermMemoryScope,
+  LongTermMemorySelection,
+  LongTermMemoryState,
+} from './memory/long-term-types.js';

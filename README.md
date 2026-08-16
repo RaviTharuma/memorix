@@ -1,378 +1,593 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Memorix" width="120">
+  <img src="https://raw.githubusercontent.com/AVIDS2/memorix/main/assets/readme-hero.svg" alt="Memorix" width="720">
 </p>
 
 <h1 align="center">Memorix</h1>
 
 <p align="center">
-  <strong>Persistent memory layer for AI coding agents.</strong><br>
-  One MCP server. Ten agents. Zero context loss.
+  <strong>Local-first shared memory layer for AI coding agents.</strong><br>
+  One project memory system for Claude Code, Codex, CodeBuddy Code, Cursor, Windsurf, Copilot, Gemini CLI, OpenCode, OpenClaw, Hermes Agent, Oh-my-Pi, Pi, Kiro, Antigravity, Trae, DeepSeek Harness, and any MCP-capable agent.
 </p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/memorix"><img src="https://img.shields.io/npm/v/memorix.svg?style=flat-square&color=cb3837" alt="npm"></a>
-  <a href="https://www.npmjs.com/package/memorix"><img src="https://img.shields.io/npm/dm/memorix.svg?style=flat-square&color=blue" alt="downloads"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg?style=flat-square" alt="license"></a>
-  <a href="https://github.com/AVIDS2/memorix"><img src="https://img.shields.io/github/stars/AVIDS2/memorix?style=flat-square&color=yellow" alt="stars"></a>
-  <img src="https://img.shields.io/badge/tests-803%20passed-brightgreen?style=flat-square" alt="tests">
-  <a href="https://github.com/AVIDS2/memorix/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/AVIDS2/memorix/ci.yml?style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://www.npmjs.com/package/memorix"><img src="https://img.shields.io/npm/v/memorix.svg?style=for-the-badge&logo=npm&color=cb3837" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/memorix"><img src="https://img.shields.io/npm/dm/memorix.svg?style=for-the-badge&logo=npm&label=monthly%20downloads&color=7c3aed" alt="monthly downloads"></a>
+  <a href="https://github.com/AVIDS2/memorix/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/AVIDS2/memorix/ci.yml?style=for-the-badge&label=CI&logo=github" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-2563eb?style=for-the-badge" alt="license"></a>
+  <a href="https://github.com/AVIDS2/memorix"><img src="https://img.shields.io/github/stars/AVIDS2/memorix?style=for-the-badge&logo=github&color=facc15" alt="stars"></a>
 </p>
 
 <p align="center">
-  <strong>v1.0 Stable | 23 MCP tools | Auto-cleanup | Multi-agent collaboration | 10 IDEs supported</strong>
+  <a href="https://registry.modelcontextprotocol.io/?q=io.github.AVIDS2%2Fmemorix">Listed in the official MCP Registry</a>
+  <br>
+  <a href="https://mcptoplist.com/server/io.github.AVIDS2%2Fmemorix"><img src="https://mcptoplist.com/badge/io.github.AVIDS2%2Fmemorix.svg" alt="View Memorix on MCP Toplist"></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/-Cursor-orange?style=flat-square" alt="Cursor">
-  <img src="https://img.shields.io/badge/-Windsurf-blue?style=flat-square" alt="Windsurf">
-  <img src="https://img.shields.io/badge/-Claude%20Code-purple?style=flat-square" alt="Claude Code">
-  <img src="https://img.shields.io/badge/-Codex-green?style=flat-square" alt="Codex">
-  <img src="https://img.shields.io/badge/-Copilot-lightblue?style=flat-square" alt="Copilot">
-  <img src="https://img.shields.io/badge/-Kiro-red?style=flat-square" alt="Kiro">
-  <img src="https://img.shields.io/badge/-Antigravity-grey?style=flat-square" alt="Antigravity">
-  <img src="https://img.shields.io/badge/-OpenCode-teal?style=flat-square" alt="OpenCode">
-  <img src="https://img.shields.io/badge/-Trae-FF6B35?style=flat-square" alt="Trae">
-  <img src="https://img.shields.io/badge/-Gemini%20CLI-4285F4?style=flat-square" alt="Gemini CLI">
+  <strong>Shared Project Memory</strong> | <strong>MCP</strong> | <strong>Git Memory</strong> | <strong>Reasoning Memory</strong> | <strong>Plugins</strong> | <strong>Orchestration</strong>
 </p>
 
 <p align="center">
-  <a href="README.zh-CN.md">中文文档</a> ·
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#features">Features</a> ·
-  <a href="#architecture">Architecture</a> ·
-  <a href="docs/SETUP.md">Setup Guide</a>
+  <a href="README.zh-CN.md">Chinese</a> |
+  <a href="#install">Install</a> |
+  <a href="#capabilities">Capabilities</a> |
+  <a href="#works-with-your-agent">Agents</a> |
+  <a href="#quick-start">Quick Start</a> |
+  <a href="#memory-model">Memory Model</a> |
+  <a href="#memcode-bundled-terminal-agent">memcode</a> |
+  <a href="ACTIVE_WORK.md">Active Work</a> |
+  <a href="#docs">Docs</a>
 </p>
 
 ---
 
-## Introduction
+> Maintainer status and the current public work boundary live in
+> [ACTIVE_WORK.md](ACTIVE_WORK.md). It is the repository's single living work
+> tracker.
 
-AI coding agents lose all context between sessions. Switch IDEs and previous decisions, debugging history, and architectural knowledge are gone. Memorix provides a shared, persistent memory layer across agents and sessions — storing decisions, gotchas, and project knowledge that any agent can retrieve instantly.
+<h2 id="what-memorix-is"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-overview.svg"><img src="assets/tags/section-overview.svg" alt="Memorix" height="32" /></picture></h2>
 
-```
-Session 1 (Cursor):      "Use JWT with refresh tokens, 15-min expiry"  → stored as decision
-Session 2 (Claude Code): "Add login endpoint"  → retrieves the decision → implements correctly
-```
+Memorix gives the AI coding agents you already use a shared, searchable project memory that survives new chats, IDE switches, terminal sessions, and handoffs. The memory lives under the Git project, not inside one chat window or one tool.
 
-No re-explaining. No copy-pasting. No vendor lock-in.
+Use Claude Code today, Codex tomorrow, and Cursor in the afternoon. The agent can change; the project memory stays the same.
 
-### Core Capabilities
+**Use Memorix when** you keep re-explaining the same project to a new agent session: the last session already figured something out, another IDE cannot see it, or a design decision is buried in a chat you cannot find anymore.
 
-- **Cross-Agent Memory**: All agents share the same memory store. Store in Cursor, retrieve in Claude Code.
-- **Multi-Agent Collaboration**: Team tools for agent coordination — join/leave, file locks, task boards, and cross-IDE messaging via shared `team-state.json`.
-- **Auto-Cleanup on Startup**: Background retention archiving and intelligent deduplication (LLM or heuristic) run automatically — zero manual maintenance.
-- **Dual-Mode Quality**: Free heuristic engine for basic dedup; optional LLM mode for intelligent compression, reranking, and conflict resolution.
-- **3-Layer Progressive Disclosure**: Search returns compact indices (~50 tokens/result), timeline shows chronological context, detail provides full content. ~10x token savings over full-text retrieval.
-- **Mini-Skills**: Promote high-value observations to permanent skills that auto-inject at every session start. Critical knowledge never decays.
-- **Memory Formation Pipeline**: Automatic fact extraction, entity resolution, and knowledge value assessment on every store. Shadow mode collects quality metrics without affecting storage.
-- **Auto-Memory Hooks**: Automatically capture decisions, errors, and gotchas from IDE tool calls. Pattern detection in English and Chinese.
-- **Knowledge Graph**: Entity-relation model compatible with [MCP Official Memory Server](https://github.com/modelcontextprotocol/servers/tree/main/src/memory). Auto-creates relations from entity extraction.
+| Problem | What Memorix adds |
+| --- | --- |
+| The next session forgets what the last session learned | Project-scoped memory, session summaries, timelines, and detail retrieval |
+| Different agents know different things | One local memory pool available through MCP, hooks, CLI, SDK, and the bundled terminal agent |
+| Git records what changed, but agents cannot recall it well | Git Memory turns commits into searchable engineering facts |
+| Architecture decisions disappear into old chats | Reasoning Memory stores why choices were made, with alternatives and trade-offs |
+| Static rule files drift | Gotchas, fixes, and project skills evolve from real work |
+| Parallel agent work gets messy | `memorix orchestrate` coordinates task context, handoffs, locks, verification, and review loops |
 
----
+Memorix is local-first. SQLite is the canonical store, Orama handles search, and LLM-backed formation/embedding is optional. Without model keys, Memorix still works with local full-text retrieval.
 
-## Quick Start
+### Capabilities
+
+Memorix is more than a memory store. It also installs agent integrations, keeps useful work events, turns commits into project facts, exposes a local control plane, and can coordinate multi-agent work when a task needs it.
+
+| Capability | What it does | Entry point |
+| --- | --- | --- |
+| Memory Autopilot | A bounded task Workset with start files, current memory, source-backed knowledge, workflow starts, cautions, and verification. Compact JSON receipts keep fallback CLI use bounded too. | `memorix context "..." --brief-json`, `memorix resume "..." --brief-json`, `memorix_project_context` |
+| Observation Memory | Searchable facts, fixes, gotchas, session summaries, and implementation notes scoped to the current Git project | `memorix memory`, MCP memory tools |
+| Curated Long-term Memory | Deliberately reviewed episodic, semantic, and procedural memory with source evidence. Only an explicitly portable user item can cross local projects | `memorix memory long-term` |
+| Code State and Code Memory | Versioned local code snapshots, file/symbol links, and freshness checks. The built-in Lite index is always honest about its limits; an already-indexed local CodeGraph can add a bounded semantic outline and is only used when fresh. | `memorix codegraph status\|init\|sync`, automatic context refresh |
+| Git Memory | Commit-derived engineering facts that answer what changed, where, and why it matters | `memorix ingest commit`, git hook |
+| Reasoning Memory | Design rationale, alternatives, trade-offs, and risks that should survive beyond one chat | `memorix reasoning`, memory formation |
+| Knowledge Workspace | Review-gated source-backed claims, Markdown pages, and canonical project workflows; proposals never overwrite reviewed pages silently | `memorix knowledge`, `memorix knowledge workflow` |
+| Agent setup | One setup path for MCP, rules, hooks, skills, plugins, bundles, or extensions depending on the agent | `memorix setup --agent <agent>` |
+| Agent doctor | Checks whether agent MCP config and guidance are current, then repairs Memorix-owned entries when needed | `memorix doctor agents`, `memorix repair agents` |
+| Hooks and skills | Optional capture from supported agents, plus reusable project skills promoted from durable knowledge | `memorix hooks`, `memorix skills` |
+| Dashboard and HTTP | A local web UI and shared MCP endpoint for browsing memory, project state, teams, and diagnostics | `memorix dashboard`, `memorix background start` |
+| Orchestration and team work | Task planning, worker handoffs, file locks, messages, verification gates, and review loops | `memorix orchestrate`, `memorix team`, `memorix lock` |
+| memcode | A bundled terminal coding agent that already reads and writes the same project memory | `memorix`, `memcode` |
+| CLI and SDK | Scriptable access for automation, imports/exports, diagnostics, and custom integrations | `memorix ...`, `createMemoryClient()` |
+
+<h2 id="works-with-your-agent"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-agents.svg"><img src="assets/tags/section-agents.svg" alt="Works with every agent" height="32" /></picture></h2>
+
+Memorix connects through the interfaces each agent already supports: plugin packages, MCP, project rules, hooks, skills, or the bundled terminal agent. `memorix setup` chooses the right setup for each agent and keeps stdio MCP as the default transport.
+
+<table>
+<tr>
+<td align="center" width="12.5%">
+<a href="https://claude.com/product/claude-code"><img src="https://github.com/anthropics.png?size=120" alt="Claude Code" width="48" height="48"></a><br>
+<strong>Claude Code</strong><br>
+<sub>official plugin + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48"></a><br>
+<strong>Codex CLI</strong><br>
+<sub>official plugin + MCP + AGENTS.md</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://github.com/features/copilot"><img src="https://github.githubassets.com/images/modules/site/copilot/copilot.png" alt="GitHub Copilot CLI" width="48" height="48"></a><br>
+<strong>GitHub Copilot CLI</strong><br>
+<sub>plugin + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://cursor.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/cursor_dark.svg"><img src="https://svgl.app/library/cursor_light.svg" alt="Cursor" width="48" height="48"></picture></a><br>
+<strong>Cursor</strong><br>
+<sub>MCP + rules + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://windsurf.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/windsurf-dark.svg"><img src="https://svgl.app/library/windsurf-light.svg" alt="Windsurf" width="48" height="48"></picture></a><br>
+<strong>Windsurf</strong><br>
+<sub>MCP + rules + hooks</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://github.com/google-gemini/gemini-cli"><img src="https://github.com/google-gemini.png?size=120" alt="Gemini CLI" width="48" height="48"></a><br>
+<strong>Gemini CLI</strong><br>
+<sub>extension + MCP + hooks + skills</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="12.5%">
+<a href="https://github.com/opencode-ai/opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/opencode-dark.svg"><img src="https://svgl.app/library/opencode.svg" alt="OpenCode" width="48" height="48"></picture></a><br>
+<strong>OpenCode</strong><br>
+<sub>local plugin + MCP + skills + AGENTS.md</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://pi.dev"><img src="https://pi.dev/favicon.svg" alt="pi coding agent" width="48" height="48"></a><br>
+<strong>pi coding agent</strong><br>
+<sub>package + extension + skill</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://kiro.dev"><img src="https://kiro.dev/icon.svg" alt="Kiro" width="48" height="48"></a><br>
+<strong>Kiro</strong><br>
+<sub>MCP + steering + hooks</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://antigravity.google"><img src="https://antigravity.google/assets/image/antigravity-logo.png" alt="Antigravity" width="48" height="48"></a><br>
+<strong>Antigravity</strong><br>
+<sub>plugin + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://www.trae.ai"><img src="https://github.com/Trae-AI.png?size=120" alt="Trae" width="48" height="48"></a><br>
+<strong>Trae</strong><br>
+<sub>MCP + project rules</sub>
+</td>
+<td align="center" width="12.5%">
+<img src="https://raw.githubusercontent.com/AVIDS2/memorix/main/assets/logo.png" alt="memcode" width="48" height="48"><br>
+<strong>memcode</strong><br>
+<sub>bundled terminal agent</sub>
+</td>
+</tr>
+<tr>
+<td align="center" width="12.5%">
+<a href="https://docs.openclaw.ai"><img src="https://raw.githubusercontent.com/openclaw/openclaw/main/ui/public/favicon.svg" alt="OpenClaw" width="48" height="48"></a><br>
+<strong>OpenClaw</strong><br>
+<sub>bundle + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://hermes-agent.nousresearch.com"><img src="https://hermes-agent.nousresearch.com/icon.png" alt="Hermes Agent" width="48" height="48"></a><br>
+<strong>Hermes Agent</strong><br>
+<sub>plugin + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://omp.sh"><img src="https://omp.sh/favicon.png" alt="Oh-my-Pi" width="48" height="48"></a><br>
+<strong>Oh-my-Pi</strong><br>
+<sub>package + MCP + hooks + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://github.com/deepseek-ai/deepseek-harness"><img src="https://github.com/deepseek-ai.png?size=120" alt="DeepSeek Harness" width="48" height="48"></a><br>
+<strong>DeepSeek Harness</strong><br>
+<sub>MCP patch + AGENTS.md + skills</sub>
+</td>
+<td align="center" width="12.5%">
+<a href="https://modelcontextprotocol.io"><img src="https://github.com/modelcontextprotocol.png?size=120" alt="Any MCP Client" width="48" height="48"></a><br>
+<strong>Any MCP Client</strong><br>
+<sub>stdio or HTTP MCP</sub>
+</td>
+</tr>
+</table>
+
+<p align="center">
+  <sub>Works with agents that speak MCP, expose hooks/rules, or support plugin/package entries. One local-first memory layer shared across all of them.</sub>
+</p>
+
+Integration surfaces:
+
+| Surface | What it does | Memorix entry |
+| --- | --- | --- |
+| Setup command | Installs the recommended one-time user-level Memorix integration | `memorix setup --agent <agent> --global` |
+| MCP | Gives an agent compact Memorix tools for project context, search, detail retrieval, storage, and resolution | bundled in setup packages or `memorix serve` |
+| Usage guidance | Teaches an agent when and how to use Memorix without forcing memory lookup on every prompt | bundled or generated by `memorix setup` |
+| Hooks | Optional capture of prompts, tool events, file edits, session lifecycle events, and native compaction checkpoints where the agent exposes them | bundled or generated by `memorix setup` |
+| Plugin or bundle package | Installs plugin, compatible-bundle, or package files where the agent supports them | Claude Code, Codex, CodeBuddy Code, GitHub Copilot CLI, Antigravity, OpenClaw, Hermes Agent, Oh-my-Pi, Pi |
+| Extension | Installs extension files where the agent supports them | Gemini CLI |
+| Local plugin | Installs local plugin files where the agent loads them directly | OpenCode |
+| MCP/rules config | Writes MCP, rules, steering, guidance, or hook config for IDEs and agents that expose those surfaces | Cursor, Windsurf, Kiro, Trae, DeepSeek Harness |
+| Skills | Turns durable project knowledge into reusable task guidance | `memorix skills` and `memorix_promote` |
+| memcode | Opens the bundled terminal agent that already uses Memorix memory | `memorix` or `memcode` |
+
+See [Integration Surfaces](docs/INTEGRATIONS.md) for the current support matrix and what each generated file means.
+
+Use the same setup command without `--global` only when you intentionally want repo-local guidance, rules, or hooks in the current Git project.
+
+CLI, MCP, and HTTP are different entry points:
+
+- `memorix` CLI is the direct command surface for setup, memory search/store, Git Memory, import/export, dashboard, orchestration, diagnostics, and automation.
+- `memorix serve` is the stdio MCP bridge used by IDEs and coding agents. Its default tool profile is `micro`, so agents see only the compact core tool set.
+- `memorix background start` / `memorix serve-http` run the HTTP service for a shared endpoint, dashboard, Docker, or multiple clients.
+
+<h2 id="install"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-install.svg"><img src="assets/tags/section-install.svg" alt="Install" height="32" /></picture></h2>
+
+Requirements:
+
+- Node.js `>=22.18.0`
+- Git, because project identity is derived from the real Git root
+
+Install and initialize:
 
 ```bash
 npm install -g memorix
+memorix init --global                   # optional defaults
+memorix setup --agent claude --global   # or codex, copilot, cursor, pi, gemini-cli, opencode,
+                                       # codebuddy, windsurf, kiro, antigravity, trae, openclaw, hermes, omp
 ```
 
-Add to your agent's MCP config:
+`memorix init` is optional. It creates or updates TOML configuration:
 
-<details open>
-<summary><strong>Cursor</strong> · <code>.cursor/mcp.json</code></summary>
+- `~/.memorix/config.toml` for global defaults
+- `<git-root>/memorix.toml` for optional project overrides
 
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
-```
-</details>
+Legacy `memorix.yml`, `.env`, and `~/.memorix/config.json` are still read for compatibility, but new setup flows use TOML.
 
-<details>
-<summary><strong>Claude Code</strong></summary>
+If you want repo-local guidance or hooks for a specific repository, run the same setup command from inside that repo without `--global`. Codex is the exception: its supported path is the user-level plugin install, so Memorix leaves project `.codex` configuration alone.
+
+<h2 id="quick-start"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-quick-start.svg"><img src="assets/tags/section-quick-start.svg" alt="Quick Start" height="32" /></picture></h2>
+
+### Connect an existing agent
+
+Use the setup command first. The global form is the normal one-time install:
 
 ```bash
-claude mcp add memorix -- memorix serve
+memorix setup --agent claude --global
+memorix setup --agent codex --global
+memorix setup --agent copilot --global
+memorix setup --agent cursor --global
+memorix setup --agent pi --global
+memorix setup --agent gemini-cli --global
+memorix setup --agent opencode --global
+memorix setup --agent windsurf --global
+memorix setup --agent kiro --global
+memorix setup --agent antigravity --global
+memorix setup --agent trae --global
+memorix setup --agent openclaw --global
+memorix setup --agent hermes --global
+memorix setup --agent codebuddy --global
+memorix setup --agent omp --global
+memorix setup --agent dsh --global
 ```
-</details>
 
-<details>
-<summary><strong>Windsurf</strong> · <code>~/.codeium/windsurf/mcp_config.json</code></summary>
+What it installs depends on the target agent, but the goal is the same: make Memorix available wherever you open that agent without asking you to wire every repo by hand.
+
+- Claude Code: installs the Memorix plugin package, adds `CLAUDE.md` guidance, and enables hook capture when you do not pass `--noHooks`.
+- Codex: installs one user-level Memorix plugin with bundled stdio MCP, skills, and lifecycle hooks. It does not write project-local `.codex` config or change your model, approval, or sandbox settings. When Codex asks, review the plugin hook definition once with `/hooks`; `--noHooks` skips automatic capture.
+- GitHub Copilot CLI: installs the Copilot plugin package and official Memorix skills.
+- Pi: installs the user-level Pi package and official skills.
+- Cursor: writes Cursor MCP/rules/config entries in the chosen scope.
+- Gemini CLI: installs the extension package, `GEMINI.md` context, hooks, and skills. Antigravity CLI has an official Gemini CLI migration path, but Gemini CLI remains an active standalone target.
+- OpenCode: installs the local plugin file, `opencode.json`, skills, and `AGENTS.md` guidance.
+- Windsurf, Kiro, Trae: write the MCP/rules/hooks files the target supports.
+- Antigravity: installs the official plugin package with `plugin.json`, `mcp_config.json`, `hooks.json`, rules, and skills under `~/.gemini/config/plugins/memorix` or `.agents/plugins/memorix`.
+- OpenClaw: installs an OpenClaw-compatible bundle with `.mcp.json`, official skills, and an OpenClaw `HOOK.md`/`handler.ts` hook pack.
+- Hermes Agent: installs into Hermes home (`%LOCALAPPDATA%\hermes` on native Windows, `~/.hermes` elsewhere, or `HERMES_HOME`), enables the plugin in `config.yaml`, registers plugin hooks, slash/CLI commands, skills, and writes MCP config.
+- CodeBuddy Code: installs a user-scope local marketplace plugin under `~/.codebuddy/memorix-local` with MCP, skills, and hooks. It does not change existing CodeBuddy model, permission, or settings files; CodeBuddy keeps third-party hook approval in its own `/hooks` flow.
+- Oh-my-Pi: installs an `omp.extensions` package with extension hook events, a `memorix` command, official skills, and writes MCP config.
+- DeepSeek Harness: writes a Memorix `@deepseek-ai/dsh-mcp-client` row into `$DSH_HOME/cordis.patch.yml` (default `~/.dsh/cordis.patch.yml`), appends guidance to the harness `AGENTS.md`, and installs official skills under `$DSH_HOME/skills`. The row follows DSH's own shipped Memorix reference, so tools appear as `mcp__memorix__*`.
+
+Need a quieter install? Add `--noHooks` for targets where setup can control hook capture separately from the host's official package entry. It keeps MCP and guidance, but skips Memorix hook capture.
+
+If you intentionally want repo-local guidance or hooks, run the same command inside that repository without `--global`.
+
+If your agent only needs a manual MCP entry, use stdio:
 
 ```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
+{
+  "mcpServers": {
+    "memorix": {
+      "command": "memorix",
+      "args": ["serve"]
+    }
+  }
+}
 ```
-</details>
 
-<details>
-<summary><strong>VS Code Copilot</strong> · <code>.vscode/mcp.json</code></summary>
+For a manually managed Claude Code entry, add `"alwaysLoad": true` inside the `memorix` server object. This lets Claude Code expose Memorix tools during print-mode startup; `memorix doctor agents --agent claude` can detect and repair a missing setting.
 
-```json
-{ "servers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
+HTTP is not required for normal setup. Use it only when you intentionally want a shared background service, dashboard, Docker, or multiple clients using the same endpoint:
+
+```bash
+memorix background start
 ```
-</details>
 
-<details>
-<summary><strong>Codex</strong> · <code>~/.codex/config.toml</code></summary>
+Then point the client at:
+
+```text
+http://localhost:3211/mcp
+```
+
+In HTTP mode, agents should bind the active repo explicitly with `memorix_session_start(projectRoot=...)` when the client can provide the workspace path. Git remains the final source of truth for project identity.
+
+### Uninstall
+
+Preview what will be removed:
+
+```bash
+memorix uninstall --dry-run
+```
+
+Stop the background service and remove hooks:
+
+```bash
+memorix uninstall --background --hooks
+```
+
+Full cleanup:
+
+```bash
+memorix uninstall --yes --background --hooks --purge-data
+npm uninstall -g memorix
+```
+
+`memorix uninstall` reports MCP config entries for manual cleanup instead of silently editing every MCP file it finds.
+
+### Work from the CLI
+
+```bash
+memorix --cwd /path/to/repo resume "continue release blocker"
+memorix checkpoint list
+memorix memory search --query "release blocker"
+memorix memory --help
+
+# Optional: activate one local agent identity for personal/team records and coordination.
+memorix identity join --agent-type codex --name codex-main
+memorix memory store --text "private investigation note" --visibility personal
+memorix task create --description "verify the release package"
+
+# Deliberate durable memory: create a candidate, then review it before it can enter a Workset.
+memorix memory long-term add --kind procedural --scope user --portability portable --title "Release verification preference" --text "Run focused tests and a packed-package smoke before publishing." --applicability "When publishing an npm package."
+memorix memory long-term qualify --id <id> --reason "The user explicitly confirmed this preference."
+memorix memory long-term approve --id <id> --reason "Reviewed for future local projects."
+
+memorix transfer export --format json --out ./.memorix-export.json
+memorix transfer import --file ./.memorix-export.json
+memorix reasoning search --query "why sqlite"
+memorix git-hook --force
+memorix ingest log --count 20
+memorix workbench
+```
+
+The CLI is direct and does not depend on an MCP session. It binds to the current Git project, or to the project supplied with `--cwd`. Without an active identity it reads, writes, and exports project-visible memory only. Use `memorix identity join` or `memorix identity use --agent-id <id>` only when you intentionally need personal/team memory or coordinated task actions; `memorix identity clear` returns the terminal to project scope. `--as <active-agent-id>` is the one-command alternative for scripts. Both camelCase and kebab-case flags are accepted.
+
+### Manage controlled media
+
+Media is opt-in. An explicit local import is copied into Memorix's local data
+directory, hashed, and kept outside the Git worktree. It becomes normal memory
+only when you attach it. Memorix never captures every screenshot or tool output.
+An asset may be up to the configured media limit (100 MiB by default). Automatic
+vision analysis is deliberately capped at 20 MiB; a larger image is still kept
+and can be attached, but Memorix records a clear text fallback instead of
+sending an oversized payload to a model provider.
+
+```bash
+memorix media import --path ./architecture.png --json
+memorix media attach --asset <asset-id> --title "Architecture diagram" --json
+memorix media list --kind image --json
+memorix media show --asset <asset-id> --json
+memorix media remove --asset <asset-id> --force --json
+
+# Controlled derivations: explicit, bounded, and attachable to memory.
+memorix media derive-pdf --asset <asset-id> --attach --json
+memorix media derive-audio --asset <asset-id> --attach --json
+
+# Legacy image analysis now uses the same controlled asset lifecycle.
+memorix ingest image --path ./architecture.png --json
+```
+
+MiniMax image generation is a deliberate CLI operation. Video generation returns
+a durable job immediately; inspect or cancel that job rather than waiting in an
+agent request.
+
+```bash
+# Configure MINIMAX_API_KEY in your user environment or .env, never in Git.
+memorix media generate image --prompt "A clean system architecture diagram" --json
+# Image-to-image with a reference image (MiniMax image-01 / image-01-live):
+memorix media generate image --prompt "Keep the subject, change the background" --image ./reference.png --json
+memorix media generate video --prompt "A short product walkthrough" --json
+memorix media status --job <media-job-id> --json
+memorix media cancel --job <media-job-id> --json
+```
+
+`memorix_media` is the compact MCP companion in every profile, including
+`micro`. It supports import, attach, list, show, PDF/audio derivations,
+generation, and job status. MCP image and video generation are disabled by
+default because they may incur provider costs.
+Set `MEMORIX_MCP_MEDIA_GENERATION=1` only after you deliberately want an agent
+to request billed MiniMax output. The normal OpenRouter text embedding lane is
+still text-only; media vectors are created only by a provider that explicitly
+declares support for that modality. Text descriptions and attachments remain a
+useful ordinary retrieval fallback.
+
+### Use the bundled terminal agent
+
+```bash
+memorix
+# or
+memcode
+```
+
+This opens memcode, a terminal coding agent that uses the same Memorix project memory as your MCP-connected agents.
+
+<h2 id="memory-model"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-memory-model.svg"><img src="assets/tags/section-memory-model.svg" alt="Memory Model" height="32" /></picture></h2>
+
+| Layer | Stores | Best for |
+| --- | --- | --- |
+| Observation Memory | facts, gotchas, fixes, implementation notes | "How does this work?" |
+| Reasoning Memory | rationale, alternatives, constraints, risks | "Why did we choose this?" |
+| Git Memory | commit-derived engineering facts | "What changed and where?" |
+| Code Memory | files, symbols, import edges, and memory-to-code freshness | "Which current code should I inspect first?" |
+| Curated Long-term Memory | reviewed episodic events, stable facts, or reusable procedures with evidence | "What should this agent still know or do later?" |
+| Compact Continuity | recent host-native compact summaries or lifecycle markers | "What survived the last context compaction?" |
+
+Search is project-scoped by default. `scope="global"` searches across projects. The search boosts Git Memory for "what changed" questions and reasoning records for "why" questions.
+
+Long-term memory is deliberately not an automatic dump of every note. A source observation, Claim, workflow, session, and code snapshot keep their existing roles. An agent may ask `memorix_store` to create an additional long-term record; an explicit request auto-qualifies and enters task briefs as a durable anchor, while hook-captured or Git-derived candidates stay pending until qualified. Approval stays an explicit operator review. Use `memorix memory long-term approve|archive|supersede` to record the evidence-backed lifecycle. Only a manually created or user-confirmed `user + portable` item may be considered in another local project; project code, Git facts, tests, workflows, sessions, and observations cannot be promoted into portable user memory.
+
+`memorix context "..."` is the default Memory Autopilot entry. It builds a compact task-lensed brief for agents: bugfix tasks lean toward tests and repros, release tasks lean toward package/changelog/build checks, onboarding tasks lean toward docs and entry points, and stale or unrelated memories stay in warning lanes instead of flooding the prompt. Use `--brief-json` when a CLI fallback needs the same bounded brief plus a receipt of what was selected or omitted; `--json` remains the detailed diagnostic form. A normal new task does not receive an old-session dump. For an explicit continuation, `memorix resume "..."` adds only the latest useful session summary, up to three readable durable anchors, and at most one recent source-labelled host compact checkpoint. A durable anchor carries a `durable:<id>` reference, so an agent can expand the full reviewed record through `memorix_detail` only when needed. Keyword matches stay primary; when no reviewed durable item matches and an embedding provider is configured, Memorix makes one 1.8-second, no-retry semantic fallback for paraphrases or cross-language tasks. A slow or unavailable provider simply leaves the normal keyword-only Workset intact. A checkpoint is lifecycle evidence, not durable memory or a transcript backup. Agents should read the suggested files before trusting stored memory.
+
+<h2 id="runtime-modes"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-runtime.svg"><img src="assets/tags/section-runtime.svg" alt="Runtime Modes" height="32" /></picture></h2>
+
+| You want | Run |
+| --- | --- |
+| Install an agent integration package | `memorix setup --agent <agent> --global` |
+| Check or repair an agent integration | `memorix doctor agents --agent <agent>`, `memorix repair agents --agent <agent>` |
+| Manually expose stdio MCP | `memorix serve` |
+| Run shared HTTP MCP plus dashboard | `memorix background start` |
+| Debug HTTP MCP in the foreground | `memorix serve-http --port 3211` |
+| Inspect or manage memory directly | `memorix memory`, `memorix reasoning`, `memorix session`, `memorix ingest`, `memorix media` |
+| Manage reviewed long-term memory | `memorix memory long-term list|show|add|promote|qualify|approve|archive|supersede` |
+| Retire memories from retrieval | `memorix purge` (current project), `memorix purge --all --yes` (everything) |
+| Inspect native compaction continuity | `memorix checkpoint list|show|context|archive` |
+| Use the interactive terminal memory control plane | `memorix workbench` |
+| Use the bundled terminal agent | `memorix` or `memcode` |
+| Run orchestrated subagent work | `memorix orchestrate --goal "..."` |
+
+`memorix serve` defaults to `--mode micro` (9 tools) to keep MCP tool schemas small for agents. `memorix setup` writes `--mode lite` into the installed MCP config so every tool taught in the generated guidance is reachable. Use `--mode team` for coordination tools, or `--mode full` for advanced and compatibility tools such as checkpoint inspection.
+
+Shortcuts and aliases: `memorix search` / `remember` / `recent` are direct query shortcuts, `bg`/`bs` start the background service, `hook` runs the hook launcher, and `memorix config get|path|migrate` inspects or migrates config files.
+
+`memorix orchestrate` uses the current checkout for single-worker runs. When running multiple workers, it creates task worktrees under `.worktrees/` and merges successful task branches back. Use `--isolated` to force worktree isolation for one worker, `--no-worktree` to disable it, `--allow-dirty` to run with uncommitted changes, and `--no-auto-merge` to preserve task worktrees for manual review.
+
+<h2 id="memcode-bundled-terminal-agent"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-memcode.svg"><img src="assets/tags/section-memcode.svg" alt="memcode" height="32" /></picture></h2>
+
+memcode is the terminal coding agent bundled with Memorix. It can read, edit, run commands, resume sessions, switch models, and use `/memory` commands — all backed by the same project memory as your MCP-connected agents.
+
+Use it when you want a terminal agent with memory already wired in.
+
+```text
+one Git project -> one shared Memorix memory pool
+```
+
+See [docs/MEMCODE.md](docs/MEMCODE.md) for the memcode-specific guide.
+
+<h2 id="configuration"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-configuration.svg"><img src="assets/tags/section-configuration.svg" alt="Configuration" height="32" /></picture></h2>
+
+Minimal `~/.memorix/config.toml`:
 
 ```toml
-[mcp_servers.memorix]
-command = "memorix"
-args = ["serve"]
+[agent]
+provider = "openai"
+model = "gpt-4o"
+api_key = "..."
+
+[memory.llm]
+provider = "openai"
+model = "gpt-4o-mini"
+api_key = "..."
+
+[embedding]
+provider = "auto"
+
+[memory]
+inject = "minimal"
+formation = "active"
 ```
-</details>
 
-<details>
-<summary><strong>Kiro</strong> · <code>.kiro/settings/mcp.json</code></summary>
+Use `[memory.llm]` and `[embedding]` for Memorix memory quality and retrieval. Use `[agent]` for the model memcode talks to while coding. Keep credentials in global config or environment variables, and do not commit secrets.
 
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
-```
-</details>
+For OpenRouter embeddings, use `provider = "api"`, `base_url = "https://openrouter.ai/api/v1"`, and `model = "qwen/qwen3-embedding-8b"`. Memorix accepts `OPENROUTER_API_KEY` for that embedding endpoint; `MEMORIX_EMBEDDING_API_KEY` remains the explicit override.
 
-<details>
-<summary><strong>Antigravity</strong> · <code>~/.gemini/antigravity/mcp_config.json</code></summary>
+For controlled MiniMax media generation, set `MINIMAX_API_KEY` (global) or
+`MINIMAX_CN_API_KEY` (China region) in your environment or `.env`. The media
+library never stores that key, a signed output URL, or base64 payloads. CLI
+generation is explicit; MCP generation additionally requires
+`MEMORIX_MCP_MEDIA_GENERATION=1`.
 
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"], "env": { "MEMORIX_PROJECT_ROOT": "/your/project/path" } } } }
-```
-</details>
+<h2 id="docker"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-docker.svg"><img src="assets/tags/section-docker.svg" alt="Docker" height="32" /></picture></h2>
 
-<details>
-<summary><strong>OpenCode</strong> · <code>~/.config/opencode/config.json</code></summary>
-
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
-```
-</details>
-
-<details>
-<summary><strong>Trae</strong> · <code>~/%APPDATA%/Trae/User/mcp.json</code></summary>
-
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
-```
-</details>
-
-<details>
-<summary><strong>Gemini CLI</strong> · <code>.gemini/settings.json</code></summary>
-
-```json
-{ "mcpServers": { "memorix": { "command": "memorix", "args": ["serve"] } } }
-```
-</details>
-
-Restart your agent. No API keys required. No cloud. No external dependencies.
-
-> **Auto-update**: Memorix checks for updates on startup (once per 24h) and self-updates in the background.
-
-> **Note**: Do not use `npx` — it re-downloads on each invocation and causes MCP timeout. Use global install.
->
-> [Full setup guide](docs/SETUP.md) · [Troubleshooting](docs/SETUP.md#troubleshooting)
-
----
-
-## Features
-
-### 23 MCP Tools (Default)
-
-| Category | Tools |
-|----------|-------|
-| **Memory** | `memorix_store` · `memorix_search` · `memorix_detail` · `memorix_timeline` · `memorix_resolve` · `memorix_deduplicate` · `memorix_suggest_topic_key` |
-| **Sessions** | `memorix_session_start` · `memorix_session_end` · `memorix_session_context` |
-| **Skills** | `memorix_skills` · `memorix_promote` |
-| **Workspace** | `memorix_workspace_sync` · `memorix_rules_sync` |
-| **Maintenance** | `memorix_retention` · `memorix_consolidate` · `memorix_transfer` · `memorix_formation_metrics` |
-| **Team** | `team_manage` · `team_file_lock` · `team_task` · `team_message` |
-| **Dashboard** | `memorix_dashboard` |
-
-<details>
-<summary><strong>+9 Optional: Knowledge Graph tools</strong> (enable in <code>~/.memorix/settings.json</code>)</summary>
-
-`create_entities` · `create_relations` · `add_observations` · `delete_entities` · `delete_observations` · `delete_relations` · `search_nodes` · `open_nodes` · `read_graph`
-
-Enable with: `{ "knowledgeGraph": true }` in `~/.memorix/settings.json`
-</details>
-
-### Observation Types
-
-Nine structured types for classifying stored knowledge:
-
-`session-request` · `gotcha` · `problem-solution` · `how-it-works` · `what-changed` · `discovery` · `why-it-exists` · `decision` · `trade-off`
-
-### Hybrid Search
-
-BM25 fulltext search works out of the box with minimal resources (~50MB RAM). Semantic vector search is opt-in with three provider options:
-
-| Provider | Configuration | Resources | Quality |
-|----------|--------------|-----------|---------|
-| **API** (recommended) | `MEMORIX_EMBEDDING=api` | Zero local RAM | Highest |
-| **fastembed** | `MEMORIX_EMBEDDING=fastembed` | ~300MB RAM | High |
-| **transformers** | `MEMORIX_EMBEDDING=transformers` | ~500MB RAM | High |
-| **Off** (default) | `MEMORIX_EMBEDDING=off` | ~50MB RAM | BM25 only |
-
-API embedding works with any OpenAI-compatible endpoint — OpenAI, Qwen/DashScope, OpenRouter, Ollama, or any proxy:
+Docker is for the HTTP service, not stdio MCP:
 
 ```bash
-MEMORIX_EMBEDDING=api
-MEMORIX_EMBEDDING_API_KEY=sk-xxx
-MEMORIX_EMBEDDING_MODEL=text-embedding-3-small
-MEMORIX_EMBEDDING_BASE_URL=https://api.openai.com/v1    # optional
-MEMORIX_EMBEDDING_DIMENSIONS=512                         # optional
+docker compose up --build -d
 ```
 
-Embedding infrastructure includes 10K LRU cache with disk persistence, batch API calls (up to 2048 texts per request), parallel processing (4 concurrent chunks), and text normalization for improved cache hit rates. Zero external dependencies — no Chroma, no SQLite.
+Then open:
 
-For local embedding:
+- dashboard: `http://localhost:3211`
+- MCP: `http://localhost:3211/mcp`
+- health: `http://localhost:3211/health`
 
-```bash
-npm install -g fastembed                     # ONNX runtime
-npm install -g @huggingface/transformers     # JS/WASM runtime
+The container must be able to access the repository path passed as `projectRoot` for project-scoped Git and config behavior.
+
+<h2 id="sdk"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-sdk.svg"><img src="assets/tags/section-sdk.svg" alt="SDK" height="32" /></picture></h2>
+
+Use Memorix directly from TypeScript:
+
+```ts
+import { createMemoryClient } from 'memorix/sdk';
+
+const client = await createMemoryClient({ projectRoot: '/path/to/repo' });
+
+await client.store({
+  entityName: 'auth-module',
+  type: 'decision',
+  title: 'Use JWT for API auth',
+  narrative: 'Chose JWT because the API is stateless and used by multiple clients.',
+});
+
+const results = await client.search({ query: 'auth decision' });
+await client.close();
 ```
 
-### LLM Enhanced Mode
+<h2 id="docs"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-docs.svg"><img src="assets/tags/section-docs.svg" alt="Docs" height="32" /></picture></h2>
 
-Optional LLM integration that significantly improves memory quality. Three capabilities layered on top of the base search:
+| Start here | Use when |
+| --- | --- |
+| [Docs Map](docs/README.md) | You want the shortest route to the right guide |
+| [Setup Guide](docs/SETUP.md) | Installing, using `memorix setup`, choosing stdio vs HTTP |
+| [Integration Surfaces](docs/INTEGRATIONS.md) | Plugin packages, MCP, project rules, hooks, and skills support |
+| [Configuration](docs/CONFIGURATION.md) | TOML config, model lanes, compatibility files |
+| [API Reference](docs/API_REFERENCE.md) | MCP tools and CLI commands |
+| [Git Memory](docs/GIT_MEMORY.md) | Commit ingestion and searchable engineering truth |
+| [Docker](docs/DOCKER.md) | Containerized HTTP service |
+| [memcode](docs/MEMCODE.md) | Using the bundled terminal agent |
+| [Agent Playbook](docs/AGENT_OPERATOR_PLAYBOOK.md) | AI-facing execution guide for install, binding, hooks, and troubleshooting |
+| [Development](docs/DEVELOPMENT.md) | Contributing, testing, release checks |
+| [Changelog](CHANGELOG.md) | What changed in each release |
 
-| Capability | Description | Measured Impact |
-|-----------|-------------|-----------------|
-| **Narrative Compression** | Compresses verbose observations before storage, preserving all technical facts | 27% token reduction (up to 44% on narrative-heavy content) |
-| **Search Reranking** | LLM reranks search results by semantic relevance to the current query | 60% of queries improved, 0% degraded |
-| **Compact on Write** | Detects duplicates and conflicts at write time; merges, updates, or skips as appropriate | Prevents redundant storage, resolves contradictions |
+LLM-friendly summaries: [llms.txt](llms.txt) and [llms-full.txt](llms-full.txt).
 
-Smart filtering ensures LLM calls are only made when beneficial — structured content like commands and file paths is bypassed automatically.
-
-```bash
-MEMORIX_LLM_API_KEY=sk-xxx
-MEMORIX_LLM_PROVIDER=openai          # openai | anthropic | openrouter | custom
-MEMORIX_LLM_MODEL=gpt-4.1-nano       # any chat completion model
-MEMORIX_LLM_BASE_URL=https://...     # custom endpoint (optional)
-```
-
-Memorix auto-detects existing environment variables:
-
-| Variable | Provider |
-|----------|----------|
-| `OPENAI_API_KEY` | OpenAI |
-| `ANTHROPIC_API_KEY` | Anthropic |
-| `OPENROUTER_API_KEY` | OpenRouter |
-
-**Without LLM**: Free heuristic deduplication (similarity-based rules). **With LLM**: Intelligent compression, contextual reranking, contradiction detection, and fact extraction.
-
-### Mini-Skills
-
-Promote high-value observations to permanent skills using `memorix_promote`. Mini-skills are:
-
-- **Permanent** — exempt from retention decay, never archived
-- **Auto-injected** — loaded into context at every `memorix_session_start`
-- **Project-scoped** — isolated per project, no cross-project pollution
-
-Use this for critical knowledge that must survive indefinitely: deployment procedures, architectural constraints, recurring gotchas.
-
-### Team Collaboration
-
-Multiple agents working in the same workspace can coordinate via 4 team tools:
-
-| Tool | Actions | Purpose |
-|------|---------|---------|
-| `team_manage` | join, leave, status | Agent registry — see who's active |
-| `team_file_lock` | lock, unlock, status | Advisory file locks to prevent conflicts |
-| `team_task` | create, claim, complete, list | Shared task board with dependencies |
-| `team_message` | send, broadcast, inbox | Direct and broadcast messaging |
-
-State is persisted to `team-state.json` and shared across all IDE processes. See [TEAM.md](TEAM.md) for the full protocol.
-
-### Auto-Memory Hooks
-
-```bash
-memorix hooks install
-```
-
-Captures decisions, errors, and gotchas automatically from IDE tool calls. Pattern detection supports English and Chinese. Smart filtering applies 30-second cooldown and skips trivial commands. High-value memories are injected at session start.
-
-### Interactive CLI
-
-```bash
-memorix              # Interactive menu
-memorix configure    # LLM + Embedding provider setup
-memorix status       # Project info and statistics
-memorix dashboard    # Web UI at localhost:3210
-memorix hooks install # Install auto-capture for IDEs
-```
-
----
-
-## Architecture
-
-```mermaid
-graph TB
-    A["Cursor · Claude Code · Windsurf · Codex · +6 more"]
-    A -->|MCP stdio| Core
-    Core["Memorix MCP Server\n22 Default Tools · Auto-Hooks · Auto-Cleanup"]
-    Core --> Search["Search Pipeline\nBM25 + Vector + Rerank"]
-    Core --> Team["Team Collab\nAgents · Tasks · Locks · Msgs"]
-    Core --> Sync["Rules & Workspace Sync\n10 Adapters"]
-    Core --> Cleanup["Auto-Cleanup\nRetention + LLM Dedup"]
-    Core --> KG["Knowledge Graph\nEntities · Relations"]
-    Search --> Disk["~/.memorix/data/\nobservations · sessions · mini-skills · team-state · entities · relations"]
-    Team --> Disk
-    KG --> Disk
-```
-
-### Search Pipeline
-
-Three-stage retrieval with progressive quality enhancement:
-
-```
-Stage 1:  Orama (BM25 + Vector Hybrid)  →  Top-N candidates
-Stage 2:  LLM Reranking (optional)      →  Reordered by semantic relevance
-Stage 3:  Recency + Project Affinity    →  Final scored results
-```
-
-### Write Pipeline
-
-```
-Input  →  Formation Pipeline (extract/resolve/evaluate)  →  LLM Compression (optional)  →  Compact on Write (dedup/merge)  →  Store + Index
-```
-
-### Key Design Decisions
-
-- **Project isolation**: Auto-detected from `git remote`. Scoped search by default.
-- **Shared storage**: All agents read/write `~/.memorix/data/`. Cross-IDE by design.
-- **Token efficiency**: 3-layer progressive disclosure (search, timeline, detail). ~10x savings.
-- **Graceful degradation**: Every LLM and embedding feature is optional. Core functionality requires zero configuration.
-
----
-
-## Development
+<h2 id="development"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-development.svg"><img src="assets/tags/section-development.svg" alt="Development" height="32" /></picture></h2>
 
 ```bash
 git clone https://github.com/AVIDS2/memorix.git
-cd memorix && npm install
-
-npm run dev       # watch mode
-npm test          # 803 tests
-npm run build     # production build
+cd memorix
+npm install
+npm run lint
+npm test
+npm run build
 ```
 
-[Architecture](docs/ARCHITECTURE.md) · [API Reference](docs/API_REFERENCE.md) · [Modules](docs/MODULES.md) · [Design Decisions](docs/DESIGN_DECISIONS.md)
+<h2 id="acknowledgements"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-acknowledgements.svg"><img src="assets/tags/section-acknowledgements.svg" alt="Acknowledgements" height="32" /></picture></h2>
 
-> For AI agents: [`llms.txt`](llms.txt) · [`llms-full.txt`](llms-full.txt)
+Memorix draws from the MCP ecosystem and prior memory projects such as mcp-memory-service, MemCP, claude-mem, and Mem0. memcode is based on the Pi coding-agent codebase and adapts its terminal-agent model for the Memorix ecosystem.
 
----
-
-## Acknowledgements
-
-Built on ideas from [mcp-memory-service](https://github.com/doobidoo/mcp-memory-service), [MemCP](https://github.com/maydali28/memcp), [claude-mem](https://github.com/anthropics/claude-code), and [Mem0](https://github.com/mem0ai/mem0).
-
-## Star History
-
-<a href="https://star-history.com/#AVIDS2/memorix&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=AVIDS2/memorix&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=AVIDS2/memorix&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=AVIDS2/memorix&type=Date" width="600" />
- </picture>
-</a>
-
-## License
+<h2 id="license"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-license.svg"><img src="assets/tags/section-license.svg" alt="License" height="32" /></picture></h2>
 
 [Apache 2.0](LICENSE)
+
+<h2 id="star-history">Star History</h2>
+
+<a href="https://github.com/AVIDS2/memorix/stargazers">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/star-history-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/star-history-light.svg">
+    <img alt="Memorix Star History" src="assets/star-history-light.svg" width="100%">
+  </picture>
+</a>
+
+<sub>Generated daily from GitHub stargazer events by GitHub Actions.</sub>
