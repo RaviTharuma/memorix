@@ -51,13 +51,13 @@ describe('neural rerank lane', () => {
       '',
       '[rerank]',
       'provider = "http"',
-      'model = "jina-reranker-v3.5"',
+      'model = "jina-ai/jina-reranker-v3.5"',
     ].join('\n'), 'utf8');
 
     const { getResolvedRerankLane } = await import('../../src/config/resolved-config.js');
     const lane = getResolvedRerankLane({ projectRoot: null, homeDir: HOME });
     expect(lane.provider).toBe('http');
-    expect(lane.model).toBe('jina-reranker-v3.5');
+    expect(lane.model).toBe('jina-ai/jina-reranker-v3.5');
     expect(lane.baseUrl).toBe('https://omniroute.jaguar-fish.ts.net/v1');
     expect(lane.apiKey).toBe('omni-from-llm');
   });

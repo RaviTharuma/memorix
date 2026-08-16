@@ -210,14 +210,14 @@ describe('resolved config', () => {
       '',
       '[rerank]',
       'provider = "http"',
-      'model = "jina-reranker-v3.5"',
+      'model = "jina-ai/jina-reranker-v3.5"',
     ].join('\n'), 'utf8');
     process.env.MEMORIX_RERANK_PROVIDER = 'http';
 
     const lane = getResolvedRerankLane({ projectRoot: null, homeDir: HOME });
 
     expect(lane.provider).toBe('http');
-    expect(lane.model).toBe('jina-reranker-v3.5');
+    expect(lane.model).toBe('jina-ai/jina-reranker-v3.5');
     expect(lane.baseUrl).toBe('https://omniroute.jaguar-fish.ts.net/v1');
     expect(lane.apiKey).toBe('omni-llm-key');
     expect(getResolvedConfig({ projectRoot: null, homeDir: HOME }).sources.env).toContain('MEMORIX_RERANK_PROVIDER');

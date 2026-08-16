@@ -49,7 +49,7 @@ api_key = "..."
 
 [rerank]
 provider = "http"
-model = "jina-reranker-v3.5"
+model = "jina-ai/jina-reranker-v3.5"
 # base_url and api_key inherit [memory.llm] when unset.
 # Point base_url at OmniRoute /v1 — never api.jina.ai.
 
@@ -202,7 +202,8 @@ body Hindsight uses (`{model, query, documents}`) to OmniRoute
 Common keys:
 
 - `provider` — `off` (default) or `http` (`jina` is accepted as an alias for `http`)
-- `model` — default `jina-reranker-v3.5`
+- `model` — default `jina-ai/jina-reranker-v3.5` (OmniRoute catalog id;
+  the bare `jina-reranker-v3.5` string returns HTTP 400)
 - `base_url` — OmniRoute OpenAI-compatible root, for example
   `https://omniroute.jaguar-fish.ts.net/v1`. In-cluster:
   `http://omniroute.omniroute.svc.cluster.local/v1`. When unset and
@@ -217,7 +218,7 @@ Environment overrides (highest priority after CLI flags):
 
 ```bash
 MEMORIX_RERANK_PROVIDER=http
-MEMORIX_RERANK_MODEL=jina-reranker-v3.5
+MEMORIX_RERANK_MODEL=jina-ai/jina-reranker-v3.5
 MEMORIX_RERANK_BASE_URL=https://omniroute.jaguar-fish.ts.net/v1
 # MEMORIX_RERANK_API_KEY=   # optional; inherits the OmniRoute LLM bearer
 ```
@@ -228,7 +229,7 @@ add only:
 ```toml
 [rerank]
 provider = "http"
-model = "jina-reranker-v3.5"
+model = "jina-ai/jina-reranker-v3.5"
 ```
 
 or set `MEMORIX_RERANK_PROVIDER=http`. Timeout is still

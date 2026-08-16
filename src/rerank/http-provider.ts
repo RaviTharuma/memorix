@@ -1,7 +1,7 @@
 /**
  * Remote neural rerank client.
  *
- * HTTP only — never loads jina-reranker-v3.5 (or any cross-encoder) in-process.
+ * HTTP only — never loads jina-ai/jina-reranker-v3.5 (or any cross-encoder) in-process.
  * Speaks the same Cohere-compatible /rerank wire format Hindsight uses:
  *   client → OmniRoute POST /v1/rerank {model, query, documents} → Jina
  *
@@ -9,7 +9,9 @@
  * the only hop that talks to Jina.
  */
 
-export const JINA_RERANKER_MODEL = 'jina-reranker-v3.5';
+// OmniRoute rejects the bare id `jina-reranker-v3.5` (HTTP 400).
+// Hindsight and Memorix send the catalog id; OmniRoute maps it to Jina.
+export const JINA_RERANKER_MODEL = 'jina-ai/jina-reranker-v3.5';
 
 export type NeuralRerankProviderName = 'http';
 

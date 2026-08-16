@@ -488,7 +488,7 @@ export default defineCommand({
         lines.push(ok(`Provider: ${config?.provider}/${config?.model}`));
         const { isNeuralRerankEnabled } = await import('../../rerank/index.js');
         const rerankCap = isNeuralRerankEnabled()
-          ? 'neural rerank (OmniRoute → jina-reranker-v3.5), LLM rerank fallback'
+          ? 'neural rerank (OmniRoute → jina-ai/jina-reranker-v3.5), LLM rerank fallback'
           : 'LLM rerank';
         lines.push(info(`Capabilities: fact extraction, auto-dedup, ${rerankCap}`));
         report.llm = { enabled: true, provider: config?.provider, model: config?.model };

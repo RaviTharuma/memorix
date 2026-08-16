@@ -493,7 +493,7 @@ What each lane does:
 | --- | --- |
 | `[agent]` | model used by memcode while coding |
 | `[memory.llm]` | memory formation, summaries, deduplication, optional LLM rerank fallback |
-| `[rerank]` | neural rerank via OmniRoute → `jina-reranker-v3.5` (never api.jina.ai) |
+| `[rerank]` | neural rerank via OmniRoute → `jina-ai/jina-reranker-v3.5` (never api.jina.ai) |
 | `[embedding]` | semantic/vector search |
 | `[memory]` | memory injection and formation behavior |
 | `[git]` | Git Memory hook and ingestion behavior |

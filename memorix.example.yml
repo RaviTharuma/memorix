@@ -39,7 +39,7 @@ embedding:
 # Bearer inherits MEMORIX_LLM_API_KEY when apiKey is omitted.
 # rerank:
 #   provider: http
-#   model: jina-reranker-v3.5
+#   model: jina-ai/jina-reranker-v3.5
 #   baseUrl: https://omniroute.jaguar-fish.ts.net/v1
 
 # ── Git-Memory Pipeline ──────────────────────────────────────
